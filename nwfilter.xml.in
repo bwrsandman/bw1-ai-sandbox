@@ -1,0 +1,27 @@
+<!-- Host-enforced egress allowlist for the sandbox VM. Rendered by sandbox.py lockdown. -->
+<filter name='bw1-sandbox' chain='root'>
+  <filterref filter='clean-traffic'/>
+  <!-- DHCP from libvirt's dnsmasq -->
+  <rule action='accept' direction='out' priority='500'>
+    <udp srcportstart='68' dstportstart='67'/>
+  </rule>
+  <rule action='accept' direction='in' priority='500'>
+    <udp srcportstart='67' dstportstart='68'/>
+  </rule>
+  <!-- host -> VM ssh (sync, spawn, fetch) -->
+  <rule action='accept' direction='in' priority='500'>
+    <tcp srcipaddr='@HOST_IP@' dstportstart='22'/>
+  </rule>
+  <!-- VM -> host Ghidra -->
+  <rule action='accept' direction='out' priority='500'>
+    <tcp dstipaddr='@HOST_IP@' dstportstart='@GHIDRA_PORT@'/>
+  </rule>
+  <!-- VM -> Anthropic API -->
+@API_RULES@
+  <rule action='drop' direction='inout' priority='1000'>
+    <all/>
+  </rule>
+  <rule action='drop' direction='inout' priority='1000'>
+    <all-ipv6/>
+  </rule>
+</filter>

@@ -1,0 +1,38 @@
+# Settings for this sandbox. Paths are relative to this file's folder.
+
+[vm]
+name = "bw1-sandbox"          # libvirt domain; also names the network filter
+state_dir = "~/.local/share/bw1-sandbox"   # ssh key, known_hosts, Claude token, portal token
+cpus = 8
+memory_mb = 16384
+disk = "20G"
+ghidra_port = 8080            # the only host port the VM may reach (besides the Anthropic API)
+api_nets = ["160.79.104.0/23"]  # Anthropic's published API range; resolved addresses are added on top
+
+[project]
+repo = "bw1-decomp"           # your clone: sync sends its checked-out HEAD as the workers' base
+upstream = "origin/main"      # sync fetches this (with your credentials) and gives it to workers as origin/main
+
+# Read-only toolchain, copied from the repo into the VM and hardlinked into each worker's clone at the same path
+toolchain = ["build/tools", "build/compilers"]
+
+# Read-only data copied into the VM, mounted in workers at `mount` and linked from the repo as `link`.
+# verify: compare file names and sizes after copying.
+[project.data]
+source = "bw1-build/orig"
+mount = "/opt/orig"
+link = "orig"
+verify = true
+required = "BW1W120/runblack-decrypted.exe"   # refuse to sync if this file is missing
+
+[worker]
+cpus = 2
+memory = "4g"
+preamble = "preamble.md"      # prepended to every task prompt
+# Run in /work before a new worker's first prompt. Explicit tool paths: configure.py then emits no
+# download rules (read-only toolchain, no internet).
+setup = ["python3", "configure.py", "--dtk", "build/tools/dtk", "--objdiff", "build/tools/objdiff-cli",
+         "--wrapper", "build/tools/wibo", "--compilers", "build/compilers",
+         "--lld-link", "build/tools/llvm/bin/lld-link"]
+# Extra Debian packages for the worker image (applied on the next build-image)
+packages = ["ninja-build", "clang-format", "llvm", "python3-pefile", "python3-yaml"]

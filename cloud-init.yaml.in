@@ -1,0 +1,29 @@
+#cloud-config
+hostname: bw1-sandbox
+users:
+  - name: decomp
+    uid: 1000
+    shell: /bin/bash
+    groups: [sudo, docker]
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - @SSH_PUBKEY@
+ssh_pwauth: false
+disable_root: true
+package_update: true
+packages:
+  - docker.io
+  - git
+  - rsync
+  - python3
+  - curl
+runcmd:
+  - [systemctl, enable, --now, docker]
+  - [install, -d, -o, decomp, -g, decomp, /srv/decomp, /srv/decomp/workers, /srv/decomp/bin, /srv/decomp/image]
+  - [install, -d, -o, root, -g, root, -m, "0755", /srv/decomp/shared, /srv/decomp/shared/build, /srv/decomp/shared/orig, /srv/decomp/shared/mcp]
+  - [install, -d, -o, root, -g, root, -m, "0700", /srv/decomp/secrets]
+  - [sudo, -u, decomp, git, init, -q, --bare, /srv/decomp/mirror.git]
+  - [sudo, -u, decomp, git, -C, /srv/decomp/mirror.git, config, gc.auto, "0"]
+  - [sudo, -u, decomp, git, -C, /srv/decomp/mirror.git, config, receive.autogc, "false"]
+  - [sudo, -u, decomp, git, config, --global, --add, safe.directory, "*"]

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ghidra": {
+      "command": "python3",
+      "args": ["/opt/mcp/bridge_mcp_ghidra.py", "--ghidra-server", "http://ghidra.host:8080/"]
+    }
+  }
+}

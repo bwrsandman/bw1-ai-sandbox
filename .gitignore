@@ -1,0 +1,7 @@
+# project clones, maintained separately
+/bw1-decomp/
+/bw1-build/
+# worker MCP config + bridge (may contain local paths)
+/local/
+__pycache__/
+.claude/settings.local.json
