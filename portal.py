@@ -4,18 +4,14 @@
   ./portal.py                                           # http://127.0.0.1:8765
   ./portal.py --host 0.0.0.0     # bind your VPN address to use it from a phone
 
-Access needs the token printed at startup (stored in ~/.local/share/bw1-sandbox/portal_token);
-opening the printed URL once sets a cookie. VM lifecycle (create/unlock/destroy) and `take`
-are CLI-only on purpose.
+Open the URL printed at startup; the portal has no authentication.
+VM lifecycle (create/unlock/destroy) and `take` are CLI-only on purpose.
 """
 
 import argparse
-import hmac
 import json
-import secrets
 import sys
 import threading
-from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -25,19 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sandbox import EFFORTS, MODELS, Sandbox, SandboxError  # noqa: E402
 
-COOKIE = "sbportal"
-
-
-def load_token(sb: Sandbox) -> str:
-    path = sb.state / "portal_token"
-    if not path.exists():
-        sb.state.mkdir(parents=True, exist_ok=True)
-        path.write_text(secrets.token_urlsafe(24))
-        path.chmod(0o600)
-    return path.read_text().strip()
-
-
-def make_handler(sb: Sandbox, token: str) -> type:
+def make_handler(sb: Sandbox) -> type:
     mutate = threading.Lock()  # one state-changing operation at a time (sync vs spawn, etc.)
 
     class Handler(BaseHTTPRequestHandler):
@@ -48,11 +32,6 @@ def make_handler(sb: Sandbox, token: str) -> type:
                 sys.stderr.write("portal: " + fmt % args + "\n")
 
         # ------------------------------------------------------------ helpers
-
-        def authed(self) -> bool:
-            c = cookies.SimpleCookie(self.headers.get("Cookie", ""))
-            got = c[COOKIE].value if COOKIE in c else self.headers.get("X-Token", "")
-            return hmac.compare_digest(got, token)
 
         def send(self, code: int, body: Any, ctype: str = "application/json", extra: Optional[Dict[str, str]] = None) -> None:
             data = body if isinstance(body, bytes) else (json.dumps(body) if ctype == "application/json" else body).encode()
@@ -90,16 +69,7 @@ def make_handler(sb: Sandbox, token: str) -> type:
             url = urlparse(self.path)
             q = parse_qs(url.query)
             if url.path == "/":
-                if "token" in q:
-                    if not hmac.compare_digest(q["token"][0], token):
-                        return self.send(403, "bad token", "text/plain")
-                    c = f"{COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000"
-                    return self.send(303, b"", "text/plain", {"Location": "/", "Set-Cookie": c})
-                if not self.authed():
-                    return self.send(403, "Open the URL printed by portal.py (it contains the access token).", "text/plain")
                 return self.send(200, PAGE, "text/html")
-            if not self.authed():
-                return self.send(403, {"error": "not authorised"})
             parts = url.path.strip("/").split("/")
             if url.path == "/api/state":
                 return self.api(lambda: state())
@@ -116,8 +86,8 @@ def make_handler(sb: Sandbox, token: str) -> type:
 
         def do_POST(self) -> None:
             # custom header: cross-site forms can't set it, so this also blocks CSRF
-            if not self.authed() or self.headers.get("X-Portal") != "1":
-                return self.send(403, {"error": "not authorised"})
+            if self.headers.get("X-Portal") != "1":
+                return self.send(403, {"error": "missing X-Portal header"})
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
             except ValueError:
@@ -150,9 +120,8 @@ def make_handler(sb: Sandbox, token: str) -> type:
 
 
 def serve(sb: Sandbox, host: str = "127.0.0.1", port: int = 8765) -> None:
-    token = load_token(sb)
-    httpd = ThreadingHTTPServer((host, port), make_handler(sb, token))
-    print(f"sandbox portal: http://{host}:{port}/?token={token}", flush=True)
+    httpd = ThreadingHTTPServer((host, port), make_handler(sb))
+    print(f"sandbox portal: http://{host}:{port}/", flush=True)
     if host not in ("127.0.0.1", "localhost", "::1"):
         print("  listening beyond localhost: make sure this address is only reachable over your VPN", flush=True)
     try:

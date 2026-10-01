@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -110,7 +111,10 @@ class Config:
 def run(cmd: List[str], *, input: Optional[bytes] = None, check: bool = True, capture: bool = True,
         env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
     """For the external programs that remain (git, rsync, virt-install, sudo): argv lists only, never a shell."""
-    p = subprocess.run(cmd, input=input, capture_output=capture, env=env)
+    try:
+        p = subprocess.run(cmd, input=input, capture_output=capture, env=env)
+    except FileNotFoundError:
+        raise SandboxError(f"command not found: {cmd[0]}; install it and make sure it is on PATH") from None
     if check and p.returncode != 0:
         err = (p.stderr or b"").decode(errors="replace").strip() if capture else ""
         raise SandboxError(f"{cmd[0]} failed ({p.returncode}): {err[-800:]}")
@@ -379,6 +383,8 @@ class Sandbox:
         return "host ready"
 
     def create(self) -> str:
+        if shutil.which("virt-install") is None:
+            raise SandboxError("virt-install is missing; on Arch Linux, install it with: sudo pacman -S virt-install")
         if self.vm_state() != "absent":
             raise SandboxError(f"{self.vm} already exists")
         self.state.mkdir(parents=True, exist_ok=True)
@@ -442,9 +448,24 @@ class Sandbox:
                          f"dstportstart='443'/></rule>")
         xml = (HERE / "nwfilter.xml.in").read_text().replace("@HOST_IP@", self.host_ip())
         xml = xml.replace("@GHIDRA_PORT@", str(self.cfg.ghidra_port)).replace("@API_RULES@\n", "\n".join(rules) + "\n")
-        self.virt.nwfilterDefineXML(xml)
+        root = ET.fromstring(xml)
+        try:
+            existing = self.virt.nwfilterLookupByName(self.vm)
+        except libvirt.libvirtError as e:
+            if e.get_error_code() != libvirt.VIR_ERR_NO_NWFILTER:
+                raise
+        else:
+            # Preserve the identity when updating an already-defined filter.
+            uuid = root.find("uuid")
+            if uuid is None:
+                uuid = ET.SubElement(root, "uuid")
+            uuid.text = existing.UUIDString()
+        defined = self.virt.nwfilterDefineXML(ET.tostring(root, encoding="unicode"))
         if not self.locked():
             self._set_filter(True)
+            # Reapply to the running interface after the restart, as a subsequent
+            # lockdown does. Use libvirt's XML to retain the assigned UUID.
+            self.virt.nwfilterDefineXML(defined.XMLDesc(0))
         return self.check()
 
     def unlock(self) -> str:

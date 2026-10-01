@@ -1,8 +1,8 @@
 # bw1-ai-sandbox
 
 Runs several `claude -p --dangerously-skip-permissions` decomp workers at once, each in its own container inside a
-dedicated libvirt/KVM VM, for [bw1-decomp](https://github.com/openblack/bw1-decomp). Nothing to install: clone this repo,
-clone the project repos into it, run the scripts.
+dedicated libvirt/KVM VM, for [bw1-decomp](https://github.com/openblack/bw1-decomp). Install the host dependencies below,
+clone this repo and the project repos into it, then run the scripts.
 
 ## Layout
 
@@ -28,7 +28,8 @@ them, except `fetch`, which adds worker branches to `bw1-decomp/` as `sandbox/<n
 git clone <your server>/bw1-ai-sandbox && cd bw1-ai-sandbox
 git clone git@github.com:openblack/bw1-decomp.git     # then add your own remotes
 git clone <bw1-build url> bw1-build
-(cd bw1-decomp && python3 configure.py && ninja build/tools/dtk)   # once, so build/tools and build/compilers exist
+# Default: version 1.2. For another version, follow "Choosing the game version" below before syncing.
+(cd bw1-decomp && python3 configure.py --version BW1W120 && ninja build/tools/dtk build/compilers/MSVC/6.5)
 
 ./sandbox.py setup-host        # enable libvirt (sudo, once)
 ./sandbox.py create            # VM + worker image + lockdown (skip if the VM already exists)
@@ -36,8 +37,47 @@ git clone <bw1-build url> bw1-build
 ./sandbox.py sync
 ```
 
-Host packages (Arch): `libvirt`, `qemu-base`, `virt-install`, `edk2-ovmf`, `python-libvirt`, `python-paramiko`,
+Host packages (Arch): `libvirt`, `qemu-base`, `virt-install`, `edk2-ovmf`, `dnsmasq`, `libvirt-python`, `python-paramiko`,
 `python-docker`, `rsync`, `git`. Python ≥ 3.11.
+
+`dnsmasq` provides DHCP and DNS for libvirt's default network; `libvirt-python` provides the Python bindings used by
+the scripts.
+
+`virt-install` is a separate package; installing libvirt alone does not provide it. If `create` reports it missing:
+
+```sh
+sudo pacman -S virt-install
+./sandbox.py create
+```
+
+### Choosing the game version
+
+The host compiler download and the worker configuration must target the same game version:
+
+| Game version | `configure.py --version` | Compiler | Ninja compiler target |
+|---|---|---|---|
+| 1.0 | `BW1W100` | MSVC 6.0 SP4 | `build/compilers/MSVC/6.4` |
+| 1.1 | `BW1W110` | MSVC 6.0 SP4 | `build/compilers/MSVC/6.4` |
+| 1.2 (default) | `BW1W120` | MSVC 6.0 SP5 | `build/compilers/MSVC/6.5` |
+
+These mappings come from [bw1-decomp's configuration](https://github.com/openblack/bw1-decomp/blob/main/configure.py).
+Building only `build/tools/dtk` does not download the compiler or populate `build/compilers`.
+
+For version 1.0, run this from the sandbox repository instead of the default toolchain command above:
+
+```sh
+(cd bw1-decomp && python3 configure.py --version BW1W100 && ninja build/tools/dtk build/compilers/MSVC/6.4)
+```
+
+Then update `sandbox.toml` before syncing:
+
+- In `[worker].setup`, add `"--version", "BW1W100"` immediately after `"configure.py"`, retaining all other arguments.
+  Configuring the host checkout alone does not select the workers' version; without this argument they default to 1.2.
+- In `[project.data]`, set `required = "BW1W100/runblack-decrypted.exe"`. The data source must contain that version's
+  original files (by default under `bw1-build/orig/BW1W100/`).
+
+Use `BW1W110` in both settings for version 1.1. After completing VM setup, run `./sandbox.py sync` to copy the
+toolchain and data before spawning workers.
 
 ## Everyday use
 
@@ -109,11 +149,11 @@ Settings live in `sandbox.toml`; `SANDBOX_CONFIG=/path/to/other.toml` selects an
 ## Portal
 
 ```sh
-./portal.py                      # prints http://127.0.0.1:8765/?token=...
+./portal.py                      # prints http://127.0.0.1:8765/
 ./portal.py --host 100.x.y.z     # your VPN address, for the phone
 ```
 
-Open the printed URL once; it sets a cookie. The token lives in the state dir (`portal_token`); delete it to rotate.
+Open the printed URL directly; no token or login is required. Anyone who can reach the portal can use its controls.
 Only bind an address reachable over your VPN: the portal is plain HTTP and can spawn and stop workers (inside the locked
 VM), but can't unlock the network or push.
 
