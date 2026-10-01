@@ -12,23 +12,28 @@ import argparse
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Set
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sandbox import EFFORTS, MODELS, Sandbox, SandboxError  # noqa: E402
 
-def make_handler(sb: Sandbox) -> type:
+
+def make_handler(sb: Sandbox, autoresume: bool = True) -> type:
     mutate = threading.Lock()  # one state-changing operation at a time (sync vs spawn, etc.)
+    stopping: Set[str] = set()  # stops run in the background, so several can be queued at once
+    stopping_lock = threading.Lock()
+    auto = {"enabled": autoresume}  # resume workers whose run ended on the usage limit, once it resets
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "sandbox-portal"
 
         def log_message(self, fmt: str, *args: Any) -> None:
-            if not self.path.startswith("/api/log/") and not self.path.startswith("/api/state"):
+            if not self.path.startswith(("/api/log/", "/api/state", "/api/orch/log")):
                 sys.stderr.write("portal: " + fmt % args + "\n")
 
         # ------------------------------------------------------------ helpers
@@ -71,11 +76,17 @@ def make_handler(sb: Sandbox) -> type:
             if url.path == "/":
                 return self.send(200, PAGE, "text/html")
             parts = url.path.strip("/").split("/")
+
+            def num(k: str) -> Optional[int]:
+                return int(q[k][0]) if q.get(k, [""])[0].isdigit() else None
             if url.path == "/api/state":
                 return self.api(lambda: state())
             if len(parts) == 3 and parts[:2] == ["api", "log"]:
-                off = int(q.get("offset", ["0"])[0])
-                return self.api(lambda: dict(zip(("events", "offset"), sb.read_log(parts[2], off))))
+                return self.api(lambda: sb.log_view(parts[2], num("offset"), num("before")))
+            if url.path == "/api/orch/sessions":
+                return self.api(sb.orchestrator_sessions)
+            if url.path == "/api/orch/log":
+                return self.api(lambda: sb.orchestrator_log(q.get("session", [""])[0], num("offset"), num("before")))
             if len(parts) == 3 and parts[:2] == ["api", "review"]:
                 return self.api(lambda: sb.review(parts[2]))
             if len(parts) == 3 and parts[:2] == ["api", "diff"]:
@@ -99,28 +110,73 @@ def make_handler(sb: Sandbox) -> type:
                 "/api/sync": sb.sync,
                 "/api/spawn": lambda: sb.spawn(name, prompt, model, effort),
                 "/api/resume": lambda: sb.resume(name, prompt, model, effort),
-                "/api/stop": lambda: sb.stop(name),
+                "/api/stop": lambda: stop(name),
+                "/api/pause": lambda: sb.pause(name),
+                "/api/unpause": lambda: sb.unpause(name),
+                "/api/autoresume": lambda: set_auto(bool(body.get("enabled"))),
                 "/api/rm": lambda: sb.rm(name),
                 "/api/fetch": lambda: sb.fetch([name] if name else []),
             }
             fn = routes.get(urlparse(self.path).path)
             if fn is None:
                 return self.send(404, {"error": "not found"})
-            self.api(fn, lock=True)
+            # stop/pause/unpause are quick or backgrounded and don't conflict with sync/spawn: never refused
+            self.api(fn, lock=urlparse(self.path).path not in ("/api/stop", "/api/pause", "/api/unpause", "/api/autoresume"))
+
+    def stop(name: str) -> str:
+        sb.live_container(name)  # report "isn't running" now, not from the background
+        with stopping_lock:
+            if name in stopping:
+                return f"{name} is already stopping"
+            stopping.add(name)
+
+        def run() -> None:
+            try:
+                sb.stop(name)
+            except Exception as e:
+                sys.stderr.write(f"portal: stopping {name} failed: {e}\n")
+            finally:
+                with stopping_lock:
+                    stopping.discard(name)
+        threading.Thread(target=run, daemon=True).start()
+        return f"stopping {name}"
+
+    def set_auto(enabled: bool) -> str:
+        auto["enabled"] = enabled
+        return f"auto-resume after the usage limit: {'on' if enabled else 'off'}"
+
+    def autoresume_loop() -> None:
+        while True:
+            time.sleep(60)
+            if not auto["enabled"] or not mutate.acquire(blocking=False):
+                continue
+            try:
+                if sb.vm_state() == "running":
+                    for m in sb.autoresume():
+                        sys.stderr.write(f"portal: {m}\n")
+            except Exception as e:  # keep the timer alive
+                sys.stderr.write(f"portal: auto-resume: {type(e).__name__}: {e}\n")
+            finally:
+                mutate.release()
+    threading.Thread(target=autoresume_loop, daemon=True).start()
 
     def state() -> Dict[str, Any]:
         vm = sb.vm_state()
+        common = {"models": MODELS, "efforts": EFFORTS, "autoresume": auto["enabled"]}
         if vm != "running":
-            return {"vm": vm, "locked": False, "workers": [], "usage": None, "models": MODELS, "efforts": EFFORTS}
+            return {"vm": vm, "locked": False, "workers": [], "usage": None, **common}
         data = sb.overview()
+        with stopping_lock:
+            for w in data["workers"]:
+                w["stopping"] = w["name"] in stopping
         return {"vm": vm, "locked": sb.locked(), "ip": sb.vm_ip(), "workers": data["workers"], "usage": data.get("usage"),
-                "models": MODELS, "efforts": EFFORTS}
+                **common}
 
     return Handler
 
 
-def serve(sb: Sandbox, host: str = "127.0.0.1", port: int = 8765) -> None:
-    httpd = ThreadingHTTPServer((host, port), make_handler(sb))
+def serve(sb: Sandbox, host: str = "127.0.0.1", port: int = 8765, autoresume: bool = True) -> None:
+    httpd = ThreadingHTTPServer((host, port), make_handler(sb, autoresume))
     print(f"sandbox portal: http://{host}:{port}/", flush=True)
     if host not in ("127.0.0.1", "localhost", "::1"):
         print("  listening beyond localhost: make sure this address is only reachable over your VPN", flush=True)
@@ -154,11 +210,19 @@ main{display:grid;grid-template-columns:260px 1fr;gap:16px;padding:16px}
 .worker small{display:block;color:var(--muted)}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--muted)}
 .dot.running{background:var(--ok)}.dot.exited{background:var(--muted)}.dot.err{background:var(--bad)}
+.dot.paused,.dot.stopping{background:var(--warn)}.dot.limited{background:none;border:2px solid var(--warn)}
+.ts{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums;margin-right:6px;font-family:system-ui,sans-serif}
+.ev>.ts{display:block}.ev.prompt pre{border-left:3px solid var(--accent)}
+#earlier{text-align:center}#earlier button{margin:4px 0 8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;margin-top:10px}
+.card{text-align:left;padding:10px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.card .last{white-space:pre-wrap;word-break:break-word;max-height:7.5em;overflow:hidden;font-size:13px}
+.auto{display:flex;align-items:center;gap:4px;margin:0;font-size:12px;color:var(--muted)}.auto input{width:auto}
 label{display:block;font-size:12px;color:var(--muted);margin:8px 0 2px}
 input,select,textarea{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px}
 textarea{min-height:90px;resize:vertical}
 .row{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
-#log{margin-top:10px;max-height:calc(100vh - 260px);overflow:auto;border-top:1px solid var(--line);padding-top:8px}
+#log{margin-top:10px;max-height:calc(100vh - 200px);overflow:auto;border-top:1px solid var(--line);padding-top:8px}
 .ev{margin:6px 0}.ev.text{white-space:pre-wrap}
 details.tool{border-left:3px solid var(--line);padding-left:8px;margin:4px 0}
 details.tool summary{cursor:pointer;color:var(--muted);font-family:ui-monospace,monospace;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -186,7 +250,10 @@ pre{background:var(--code);padding:8px;border-radius:6px;overflow:auto;font-size
   <div id="usage" class="usage" title="subscription usage, from the latest worker API call"></div>
   <button onclick="act('check')">Check lockdown</button>
   <button onclick="act('sync')" title="push committed HEAD + toolchain to the VM">Sync</button>
+  <button onclick="showOverview()">Overview</button>
+  <button onclick="showOrch()" title="the orchestrator Claude session(s) started in this folder">Orchestrator</button>
   <button onclick="showLearnings()">Learnings</button>
+  <label class="auto" title="resume workers whose run ended on the usage limit, once it resets"><input type="checkbox" id="auto" onchange="setAuto(this.checked)"> auto-resume</label>
 </header>
 <main>
   <section class="panel">
@@ -197,7 +264,9 @@ pre{background:var(--code);padding:8px;border-radius:6px;overflow:auto;font-size
 </main>
 <div id="toast"></div>
 <script>
-let S = {workers: [], models: [], efforts: []}, sel = null, logOff = 0, logTimer = null, follow = true, tools = {};
+let S = {workers: [], models: [], efforts: []}, view = 'new', sel = null, follow = true;
+// log viewer: url prefix, next byte to follow from, first byte shown (for "Load earlier"), tool call elements by id
+let L = {gen: 0, url: '', off: null, start: 0, timer: null, tools: {}};
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 // Minimal markdown: escape first, then add a known-safe subset of tags (worker output is untrusted)
@@ -250,13 +319,39 @@ async function refresh(){
   $('#vm').innerHTML = 'VM <b class="'+(S.vm==='running'?'ok':'bad')+'">'+esc(S.vm)+'</b>';
   $('#lock').innerHTML = S.locked ? '<span class="ok">locked down</span>' : '<span class="bad">NOT locked</span>';
   renderUsage(S.usage);
-  $('#workers').innerHTML = S.workers.length ? S.workers.map(w=>{
-    const cls = w.state==='running'?'running':(w.result&&w.result.subtype!=='success'?'err':'exited');
-    return `<button class="worker ${w.name===sel?'sel':''}" onclick="select('${esc(w.name)}')"><span class="dot ${cls}"></span><b>${esc(w.name)}</b><small>${esc(w.status)}${runInfo(w)?' · '+esc(runInfo(w)):''}${w.result&&w.result.cost!=null?' · $'+w.result.cost.toFixed(2):''}</small></button>`}).join('')
+  $('#auto').checked = !!S.autoresume;
+  $('#workers').innerHTML = S.workers.length ? S.workers.map(w=>
+    `<button class="worker ${w.name===sel?'sel':''}" onclick="select('${esc(w.name)}')"><span class="dot ${dotCls(w)}"></span><b>${esc(w.name)}</b><small>${esc(statusText(w))}${runInfo(w)?' · '+esc(runInfo(w)):''}${w.result&&w.result.cost!=null?' · $'+w.result.cost.toFixed(2):''}</small></button>`).join('')
     : '<div class="empty">No workers yet.</div>';
-  if(sel===null && !$('#newform') && !$('#learnview')) renderNew();
-  else if(sel) renderHeader();
+  if(view==='new' && !$('#newform')) renderNew();
+  else if(view==='worker') renderHeader();
+  else if(view==='overview') renderOverview();
 }
+const live = w => w.state==='running' || w.state==='paused';
+function dotCls(w){
+  if(w.stopping) return 'stopping';
+  if(live(w)) return w.state;
+  if(w.limited) return 'limited';
+  return w.result&&w.result.subtype!=='success'?'err':'exited';
+}
+function statusText(w){
+  let t=(w.stopping?'stopping… ':'')+w.status;
+  if(w.limited&&!live(w)){
+    const r=w.limited.resetsAt;
+    t+=' · usage limit'+(r?(S.autoresume?' · auto-resume after ':' · resets ')+fmtEpoch(r):'');
+  }
+  return t;
+}
+const fmtEpoch = t => new Date(t*1000).toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit'});
+function ago(t){const s=Math.max(0,Math.round(Date.now()/1000-t));return s<90?s+'s':s<5400?Math.round(s/60)+' min':s<172800?Math.round(s/3600)+' h':Math.round(s/86400)+' d'}
+function fmtTs(ts){
+  const d=new Date(ts); if(!ts||isNaN(d))return '';
+  return d.toDateString()===new Date().toDateString()
+    ? d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})
+    : d.toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+function tsTag(ts){const t=fmtTs(ts);return t?`<time class="ts" title="${esc(new Date(ts).toLocaleString())}">${esc(t)}</time>`:''}
+async function setAuto(on){try{toast(await post('/api/autoresume',{enabled:on}))}catch(e){toast(e.message,true)}refresh()}
 function renderUsage(u){
   const el=$('#usage');
   if(!u){el.innerHTML='<span class="note">usage: no data yet</span>';return}
@@ -288,35 +383,38 @@ async function spawn(){
   if(S.workers.some(w=>w.name===name)) select(name);
 }
 function select(name){
-  sel=name; tools={}; headKey='';
-  if(name===null){renderNew();refresh();return}
+  sel=name; headKey='';
+  if(name===null){view='new';renderNew();refresh();return}
+  view='worker';
   $('#detail').innerHTML = `<div id="whead"></div><div id="wout"></div><div id="log"></div>`;
-  renderHeader(); startLog(); refresh();
+  renderHeader(); startLog('/api/log/'+encodeURIComponent(name)+'?'); refresh();
 }
-function metaText(w){const r=w.result;return `${w.status}${runInfo(w)?' · '+runInfo(w):''}${r?` · ${r.turns} turns · $${(r.cost||0).toFixed(2)} · ${Math.round(r.seconds/60)} min`:''}`}
+function metaText(w){const r=w.result;return `${statusText(w)}${runInfo(w)?' · '+runInfo(w):''}${r?` · ${r.turns} turns · $${(r.cost||0).toFixed(2)} · ${Math.round(r.seconds/60)} min`:''}`}
 let headKey='';
 function renderHeader(){
   const w=S.workers.find(x=>x.name===sel); if(!w||!$('#whead'))return;
-  const running=w.state==='running';
+  const running=live(w), n=esc(w.name);
   // Rebuild only when the buttons/forms change; otherwise the 5s refresh would wipe what you're typing
-  const key=w.name+'|'+running;
+  const key=w.name+'|'+w.state+'|'+!!w.stopping;
   if(key===headKey && $('#wmeta')){$('#wmeta').textContent=metaText(w);return}
   headKey=key;
   $('#whead').innerHTML = `<div class="row" style="justify-content:space-between">
       <div><b style="font-size:16px">${esc(w.name)}</b> <span class="meta" id="wmeta">${esc(metaText(w))}</span></div>
       <div class="row">
-        ${running?`<button class="danger" onclick="act('stop',{name:'${esc(w.name)}'},'Stop ${esc(w.name)}?')">Stop</button>`:''}
+        ${w.state==='running'&&!w.stopping?`<button onclick="act('pause',{name:'${n}'})" title="freeze in place: no API requests until unpaused">Pause</button>`:''}
+        ${w.state==='paused'&&!w.stopping?`<button onclick="act('unpause',{name:'${n}'})">Unpause</button>`:''}
+        ${running&&!w.stopping?`<button class="danger" onclick="act('stop',{name:'${n}'},'Stop ${n}?')">Stop</button>`:''}
         <button onclick="fetchReview('${esc(w.name)}')">Fetch + review</button>
         <button onclick="showDiff('${esc(w.name)}')">Diff</button>
-        ${running?'':`<button class="danger" onclick="act('rm',{name:'${esc(w.name)}'},'Delete worker ${esc(w.name)} and its clone? Fetch first if you want its work.').then(()=>select(null))">Remove</button>`}
+        ${running||w.stopping?'':`<button class="danger" onclick="act('rm',{name:'${esc(w.name)}'},'Delete worker ${esc(w.name)} and its clone? Fetch first if you want its work.').then(()=>select(null))">Remove</button>`}
         <label style="margin:0"><input type="checkbox" style="width:auto" ${follow?'checked':''} onchange="follow=this.checked"> follow</label>
       </div></div>
     <details><summary class="meta">Task</summary><pre>${esc(w.prompt)}</pre></details>
-    ${running?'':`<form onsubmit="event.preventDefault();followup('${esc(w.name)}')" style="margin-top:6px">
+    ${running||w.stopping?'':`<form onsubmit="event.preventDefault();followup('${esc(w.name)}')" style="margin-top:6px">
       <label>Follow-up prompt (continues this worker's session)</label><textarea id="fprompt" required></textarea>
       <div class="row" style="margin-top:6px"><select id="fmodel" style="width:auto">${models()}</select><select id="feffort" style="width:auto">${efforts()}</select><button class="primary">Send follow-up</button></div></form>`}`;
 }
-async function followup(name){await act('resume',{name,prompt:$('#fprompt').value,model:$('#fmodel').value,effort:$('#feffort').value});startLog(true)}
+async function followup(name){await act('resume',{name,prompt:$('#fprompt').value,model:$('#fmodel').value,effort:$('#feffort').value});startLog(L.url,true)}
 async function fetchReview(name){
   $('#wout').innerHTML='<p class="meta">fetching…</p>';
   try{const f=await post('/api/fetch',{name});const r=await get('/api/review/'+encodeURIComponent(name));
@@ -328,36 +426,82 @@ async function showDiff(name){
   catch(e){toast(e.message,true)}
 }
 async function showLearnings(){
-  sel=null; stopLog();
+  sel=null; view='learn'; stopLog(); refresh();
   try{const l=await get('/api/learnings');$('#detail').innerHTML=`<b id="learnview">Proposed learnings</b><pre>${esc(l)||'(none yet)'}</pre>`}catch(e){toast(e.message,true)}
 }
-function stopLog(){clearTimeout(logTimer);logTimer=null}
-function startLog(keep){stopLog(); if(!keep){logOff=0; $('#log').innerHTML=''} pollLog()}
-async function pollLog(){
-  const name=sel; if(!name)return;
-  try{
-    const r=await get('/api/log/'+encodeURIComponent(name)+'?offset='+logOff);
-    if(name!==sel)return;
-    logOff=r.offset; r.events.forEach(addEvent);
-    if(r.events.length&&follow){const l=$('#log');l.scrollTop=l.scrollHeight}
-  }catch(e){}
-  const w=S.workers.find(x=>x.name===name);
-  logTimer=setTimeout(pollLog, w&&w.state==='running'?2000:8000);
+function showOverview(){view='overview';sel=null;stopLog();$('#detail').innerHTML='<div id="ov"></div>';refresh()}
+function renderOverview(){
+  const el=$('#ov'); if(!el)return;
+  const count=st=>S.workers.filter(w=>w.state===st).length, lim=S.workers.filter(w=>w.limited&&!live(w)).length;
+  el.innerHTML=`<div class="row" style="justify-content:space-between"><b>Overview</b><span class="meta">${count('running')} running · ${count('paused')} paused${lim?' · '+lim+' stopped on usage limit':''} · ${S.workers.length} total</span></div>
+    <div class="grid">${S.workers.map(w=>`<button class="card" onclick="select('${esc(w.name)}')">
+      <div><span class="dot ${dotCls(w)}"></span><b>${esc(w.name)}</b></div>
+      <div class="meta">${esc(statusText(w))}${runInfo(w)?' · '+esc(runInfo(w)):''}${w.result&&w.result.cost!=null?' · $'+w.result.cost.toFixed(2):''}</div>
+      <div class="meta">${w.active_at?'last message '+ago(Date.parse(w.active_at)/1000)+' ago':'no messages yet'}</div>
+      ${w.last?`<div class="last">${esc(w.last.text)}</div>`:''}</button>`).join('')||'<div class="empty">No workers yet.</div>'}</div>`;
 }
-function addEvent(e){
-  const log=$('#log'); if(!log)return;
-  if(e.kind==='text'){log.insertAdjacentHTML('beforeend',`<div class="ev md">${md(e.text)}</div>`)}
+async function showOrch(){
+  view='orch'; sel=null; stopLog(); refresh();
+  $('#detail').innerHTML=`<div class="row" style="justify-content:space-between"><b>Orchestrator</b>
+      <div class="row"><select id="osess" style="width:auto;max-width:60vw" onchange="startLog('/api/orch/log?session='+encodeURIComponent(this.value)+'&')"></select>
+      <label style="margin:0"><input type="checkbox" style="width:auto" ${follow?'checked':''} onchange="follow=this.checked"> follow</label></div></div>
+    <div class="meta">Claude Code sessions started in this folder, newest first (read-only).</div><div id="log"></div>`;
+  try{
+    const ss=await get('/api/orch/sessions'); if(view!=='orch')return;
+    if(!ss.length){$('#log').innerHTML='<div class="empty">No sessions yet: start one in this folder (see README, Orchestrator).</div>';return}
+    $('#osess').innerHTML=ss.map(x=>`<option value="${esc(x.id)}">${esc(x.title||x.id.slice(0,8))} · ${esc(ago(x.mtime))} ago</option>`).join('');
+    startLog('/api/orch/log?session='+encodeURIComponent(ss[0].id)+'&');
+  }catch(e){toast(e.message,true)}
+}
+// Logs open on the newest events; "Load earlier" walks back. While catching up, windows are fetched back to back.
+function stopLog(){clearTimeout(L.timer);L.timer=null;L.gen++}
+function startLog(url,keep){
+  stopLog(); L.url=url;
+  if(!keep||L.off===null){L.off=null;L.start=0;L.tools={};$('#log').innerHTML='<div id="earlier"></div><div id="evs"></div>'}
+  pollLog(L.gen);
+}
+async function pollLog(gen){
+  let more=false;
+  try{
+    const first=L.off===null, r=await get(L.url+(first?'':'offset='+L.off));
+    if(gen!==L.gen)return;
+    const box=$('#evs'); if(!box)return;
+    r.events.forEach(e=>addEvent(e,box));
+    L.off=r.offset; more=!!r.more;
+    if(first){L.start=r.start;renderEarlier()}
+    if(r.events.length&&(follow||first)){const l=$('#log');l.scrollTop=l.scrollHeight}
+  }catch(e){}
+  if(gen!==L.gen)return;
+  const w=S.workers.find(x=>x.name===sel);
+  L.timer=setTimeout(()=>pollLog(gen), more?0:view==='orch'?3000:w&&w.state==='running'?2000:8000);
+}
+function renderEarlier(){const el=$('#earlier');if(el)el.innerHTML=L.start>0?'<button onclick="loadEarlier()">Load earlier</button>':''}
+async function loadEarlier(){
+  const gen=L.gen;
+  try{
+    const r=await get(L.url+'before='+L.start); if(gen!==L.gen)return;
+    const tmp=document.createElement('div'); r.events.forEach(e=>addEvent(e,tmp));
+    const log=$('#log'), h=log.scrollHeight;
+    $('#evs').prepend(...tmp.childNodes);
+    log.scrollTop+=log.scrollHeight-h;  // keep what you were reading in place
+    L.start=r.start; renderEarlier();
+  }catch(e){toast(e.message,true)}
+}
+function addEvent(e,box){
+  const ts=tsTag(e.ts);
+  if(e.kind==='text'){box.insertAdjacentHTML('beforeend',`<div class="ev md">${ts}${md(e.text)}</div>`)}
+  else if(e.kind==='prompt'){box.insertAdjacentHTML('beforeend',`<div class="ev prompt">${ts}<pre>${esc(e.text)}</pre></div>`)}
   else if(e.kind==='tool'){
     let first=e.input; try{const o=JSON.parse(e.input);first=o.command||o.file_path||o.pattern||o.description||e.input}catch(_){}
     const d=document.createElement('details');d.className='tool';
-    d.innerHTML=`<summary>${esc(e.name)} · ${esc(String(first).split('\n')[0])}</summary><pre>${esc(e.input)}</pre>`;
-    log.appendChild(d); tools[e.id]=d;
+    d.innerHTML=`<summary>${ts}${esc(e.name)} · ${esc(String(first).split('\n')[0])}</summary><pre>${esc(e.input)}</pre>`;
+    box.appendChild(d); L.tools[e.id]=d;
   } else if(e.kind==='tool_result'){
-    const d=tools[e.id]; const html=`<pre>${esc(e.text)}</pre>`;
-    if(d){d.insertAdjacentHTML('beforeend',html); if(e.error)d.classList.add('err')} else log.insertAdjacentHTML('beforeend',html);
+    const d=L.tools[e.id]; const html=`<pre>${esc(e.text)}</pre>`;
+    if(d){d.insertAdjacentHTML('beforeend',html); if(e.error)d.classList.add('err')} else box.insertAdjacentHTML('beforeend',html);
   } else if(e.kind==='result'){
-    log.insertAdjacentHTML('beforeend',`<div class="ev result md"><div class="meta"><b>${esc(e.subtype)}</b> · ${e.turns} turns · $${(e.cost||0).toFixed(2)}</div>${md(e.text)}</div>`);
-  } else log.insertAdjacentHTML('beforeend',`<div class="ev meta">${esc(e.text)}</div>`);
+    box.insertAdjacentHTML('beforeend',`<div class="ev result md"><div class="meta"><b>${esc(e.subtype)}</b> · ${e.turns} turns · $${(e.cost||0).toFixed(2)}</div>${md(e.text)}</div>`);
+  } else box.insertAdjacentHTML('beforeend',`<div class="ev meta">${ts}${esc(e.text)}</div>`);
 }
 refresh(); setInterval(refresh, 5000);
 </script></body></html>
@@ -368,8 +512,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="127.0.0.1", help="address to bind (use your VPN address for phone access)")
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--no-autoresume", action="store_true", help="start with auto-resume after the usage limit off")
     args = ap.parse_args()
-    serve(Sandbox(), args.host, args.port)
+    serve(Sandbox(), args.host, args.port, not args.no_autoresume)
     return 0
 
 

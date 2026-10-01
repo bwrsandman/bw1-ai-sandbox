@@ -9,12 +9,13 @@ Errors go to stderr as {"error": ...} with exit status 1. Stdlib only (the VM ha
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 ROOT = Path("/srv/decomp")
 WORKERS = ROOT / "workers"
@@ -151,12 +152,20 @@ def op_update_workers(a: Dict[str, Any]) -> Dict[str, Any]:
     return {"updated": updated, "failed": failed}
 
 
-def last_rate_limit(log: Path) -> Dict[str, Any]:
-    """The newest rate_limit_event in a log (Claude Code writes one per API response), from its tail."""
+# A run ended on the subscription limit: Claude Code's result text, as a fallback to the rate_limit_event status
+LIMIT_RE = re.compile(r"usage limit|hit your (?:\w+ )?limit", re.I)
+
+
+def tail_lines(log: Path, size: int = 512_000) -> List[bytes]:
+    """The log's last `size` bytes as lines (the first may be partial; it then fails to parse and is skipped)."""
     with open(log, "rb") as f:
-        f.seek(max(0, log.stat().st_size - 512_000))
-        tail = f.read()
-    for line in reversed(tail.splitlines()):
+        f.seek(max(0, log.stat().st_size - size))
+        return f.read().splitlines()
+
+
+def last_rate_limit(lines: List[bytes]) -> Dict[str, Any]:
+    """The newest rate_limit_event (Claude Code writes one per API response)."""
+    for line in reversed(lines):
         if b'"rate_limit_event"' in line:
             try:
                 return json.loads(line).get("rate_limit_info") or {}
@@ -165,35 +174,79 @@ def last_rate_limit(log: Path) -> Dict[str, Any]:
     return {}
 
 
+def last_activity(lines: List[bytes]) -> Tuple[Optional[Dict[str, Any]], str]:
+    """The newest assistant text (for the overview) and the newest message timestamp."""
+    last, active = None, ""
+    for line in reversed(lines):
+        if last is not None:
+            break
+        if b'"timestamp"' not in line:
+            continue
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        active = active or m.get("timestamp") or ""
+        if m.get("type") == "assistant":
+            texts = [c.get("text", "") for c in m.get("message", {}).get("content", [])
+                     if c.get("type") == "text" and c.get("text", "").strip()]
+            if texts:
+                last = {"text": texts[-1][:600], "ts": m.get("timestamp")}
+    return last, active
+
+
+def scan_log(log: Path) -> Dict[str, Any]:
+    """One pass over a worker's log: model, newest result, and whether the newest run ended on the usage limit."""
+    result = model = run_result = None
+    run_limit: Dict[str, Any] = {}
+    with open(log, "rb") as f:
+        for line in f:
+            if b'"type":"result"' not in line and b'"subtype":"init"' not in line and b'"rate_limit_event"' not in line:
+                continue
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if m.get("type") == "result":
+                result = run_result = {"subtype": m.get("subtype"), "text": (m.get("result") or "")[:4000],
+                                       "turns": m.get("num_turns"), "cost": m.get("total_cost_usd"),
+                                       "seconds": (m.get("duration_ms") or 0) / 1000, "error": bool(m.get("is_error"))}
+            elif m.get("type") == "rate_limit_event":
+                run_limit = m.get("rate_limit_info") or {}
+            elif m.get("subtype") == "init":
+                model, run_result, run_limit = m.get("model"), None, {}
+    limited = None
+    if run_result is not None:
+        rejected = run_limit.get("status") == "rejected"
+        if rejected or (run_result["error"] and LIMIT_RE.search(run_result["text"])):
+            windows = (run_limit.get("unifiedWindows") or {}).values()
+            # only a rejection says which reset matters; otherwise use a window that is actually full
+            resets = (run_limit.get("resetsAt") if rejected else None) or max(
+                (w.get("resetsAt") or 0 for w in windows if (w.get("utilization") or 0) >= 1), default=0)
+            limited = {"resetsAt": resets or None, "type": run_limit.get("rateLimitType")}
+    return {"result": result, "model": model, "limited": limited}
+
+
 def op_workers(a: Dict[str, Any]) -> Dict[str, Any]:
-    """Per worker: final result, model (from the log), last run's settings, the task prompt.
+    """Per worker: final result, model (from the log), last run's settings, the task prompt, the newest message,
+    and whether the latest run ended on the usage limit (`limited`, with the reset time).
     Plus the account's subscription usage, from the most recently written log that has a reading."""
     out: List[Dict[str, Any]] = []
     usage: Dict[str, Any] = {}
     usage_at = 0.0
     for w in sorted(WORKERS.iterdir()) if WORKERS.is_dir() else []:
         log = w / "home" / "agent.jsonl"
-        result = model = None
         size = log.stat().st_size if log.exists() else 0
-        if size and log.stat().st_mtime > usage_at:
-            info = last_rate_limit(log)
-            if info:
-                usage, usage_at = info, log.stat().st_mtime
+        scan: Dict[str, Any] = {"result": None, "model": None, "limited": None}
+        last, active = None, ""
         if size:
-            with open(log, "rb") as f:
-                for line in f:
-                    if b'"type":"result"' not in line and b'"subtype":"init"' not in line:
-                        continue
-                    try:
-                        m = json.loads(line)
-                    except ValueError:
-                        continue
-                    if m.get("type") == "result":
-                        result = {"subtype": m.get("subtype"), "text": (m.get("result") or "")[:4000],
-                                  "turns": m.get("num_turns"), "cost": m.get("total_cost_usd"),
-                                  "seconds": (m.get("duration_ms") or 0) / 1000}
-                    elif m.get("subtype") == "init":
-                        model = m.get("model")
+            tail = tail_lines(log)
+            if log.stat().st_mtime > usage_at:
+                info = last_rate_limit(tail)
+                if info:
+                    usage, usage_at = info, log.stat().st_mtime
+            last, active = last_activity(tail)
+            scan = scan_log(log)
         run: Dict[str, Any] = {}
         runs = w / "runs.jsonl"
         if runs.exists():
@@ -204,9 +257,10 @@ def op_workers(a: Dict[str, Any]) -> Dict[str, Any]:
                 except ValueError:
                     pass
         prompt = (w / "prompt.md").read_text(errors="replace") if (w / "prompt.md").exists() else ""
-        out.append({"name": w.name, "log_bytes": size, "result": result, "model": model or run.get("model") or None,
+        out.append({"name": w.name, "log_bytes": size, "result": scan["result"], "limited": scan["limited"],
+                    "model": scan["model"] or run.get("model") or None, "run_model": run.get("model") or "",
                     "effort": run.get("effort") or None, "prompt": prompt.split("## Task", 1)[-1].strip()[:2000],
-                    "learnings": (w / "home" / "learnings.md").exists()})
+                    "last": last, "active_at": active, "learnings": (w / "home" / "learnings.md").exists()})
     return {"workers": out, "usage": {**usage, "observed_at": usage_at} if usage else None}
 
 

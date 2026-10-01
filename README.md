@@ -138,6 +138,8 @@ setup-host | create | token | sync | check | start | shutdown | destroy
 spawn NAME "prompt" [-m MODEL] [-e EFFORT]   (also: -f FILE, or - for stdin)
 resume NAME "prompt"                         follow-up for a finished worker (continues its session)
 ls | status | logs NAME [--results] | tail NAME [N] | shell NAME | stop NAME | rm NAME
+pause NAME | unpause NAME                    freeze a running worker in place (no API requests) / continue it
+autoresume                                   loop: resume workers stopped by the usage limit once it resets
 fetch [NAME...] | review NAME | diff NAME | take NAME [BRANCH] | learnings [NAME...]
 unlock | build-image | lockdown              update the worker image (Claude Code version, packages)
 ghidra-forward                               forward the VM-visible host IP to Ghidra on 127.0.0.1
@@ -153,9 +155,19 @@ Settings live in `sandbox.toml`; `SANDBOX_CONFIG=/path/to/other.toml` selects an
 ./portal.py --host 100.x.y.z     # your VPN address, for the phone
 ```
 
-Open the printed URL directly; no token or login is required. Anyone who can reach the portal can use its controls.
-Only bind an address reachable over your VPN: the portal is plain HTTP and can spawn and stop workers (inside the locked
-VM), but can't unlock the network or push.
+Open the printed URL directly; no token or login is required. Anyone who can reach the portal can use its controls
+and read the orchestrator's transcripts. Only bind an address reachable over your VPN: the portal is plain HTTP and can
+spawn and stop workers (inside the locked VM), but can't unlock the network or push.
+
+- **Logs** open on the newest events (with timestamps); *Load earlier* walks back through the log.
+- **Pause** freezes a worker in place (`docker pause`): it sends no API requests until *Unpause*. Its process, open
+  files and in-flight tool calls stay as they were; a request that was streaming when frozen is retried by Claude Code.
+- **Stop** runs in the background, so you can stop several workers in a row without waiting for each.
+- **Overview** shows every worker at once: state, settings, cost, and its newest message.
+- **Orchestrator** shows the transcripts of Claude Code sessions started in this folder (newest first, read-only).
+- **Auto-resume** (header checkbox; on at startup unless `--no-autoresume`): a worker whose run ended on the subscription usage limit gets a
+  follow-up ("the limit has reset, continue") with the same model and effort, a minute after the limit's reset time.
+  Workers you stopped or paused are never touched. Without the portal, `./sandbox.py autoresume` does the same.
 
 ## Orchestrator
 
@@ -165,8 +177,8 @@ claude --remote-control bw1-orchestrator   # in this folder; drive it from claud
 ```
 
 Approve the `sandbox` MCP server once. To avoid approving every poll, allow in `.claude/settings.local.json`:
-`mcp__sandbox__vm_status`, `check`, `workers`, `log`, `review`, `diff`, `learnings`, `fetch`, `spawn`, `resume`
-(each prefixed `mcp__sandbox__`). Leave `stop`, `remove` and `sync` asking.
+`mcp__sandbox__vm_status`, `check`, `workers`, `log`, `review`, `diff`, `learnings`, `fetch`, `spawn`, `resume`,
+`pause`, `unpause` (each prefixed `mcp__sandbox__`). Leave `stop`, `remove` and `sync` asking.
 
 ## Ghidra MCP
 

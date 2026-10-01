@@ -55,7 +55,9 @@ def sync() -> str:
 
 @mcp.tool()
 def workers() -> List[Dict[str, Any]] | str:
-    """All workers: container state/status, model, effort, prompt, final result (subtype, text, turns, cost)."""
+    """All workers: container state/status (running, paused, exited), model, effort, prompt, final result
+    (subtype, text, turns, cost), newest message (`last`), and `limited` (with `resetsAt`, epoch seconds) when
+    the latest run ended on the subscription usage limit. The portal resumes those after the reset."""
     return _call(sb.workers)
 
 
@@ -78,6 +80,18 @@ def resume(name: str, prompt: str, model: str = "", effort: str = "") -> str:
 def stop(name: str) -> str:
     """Stop a running worker (its work so far stays in its clone; resume can continue it)."""
     return _call(sb.stop, name)
+
+
+@mcp.tool()
+def pause(name: str) -> str:
+    """Freeze a running worker in place: it sends no API requests until unpause (e.g. to save session usage)."""
+    return _call(sb.pause, name)
+
+
+@mcp.tool()
+def unpause(name: str) -> str:
+    """Continue a paused worker exactly where it was frozen."""
+    return _call(sb.unpause, name)
 
 
 @mcp.tool()

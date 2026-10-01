@@ -29,7 +29,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import libvirt
 import paramiko
@@ -51,6 +51,13 @@ EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
 LEAK_PROBES = [("1.1.1.1", 443), ("8.8.8.8", 53)]
 FALLBACK_API_IP = "160.79.104.10"
 FALLBACK_GITHUB_IP = "140.82.112.3"
+TAIL_BYTES = 600_000      # a log viewer opens on this many bytes of the newest events
+WINDOW_BYTES = 2_000_000  # then follows / scrolls back in windows of this size
+SESSION_RE = re.compile(r"^[0-9a-f-]{36}$")
+AUTORESUME_GRACE = 60     # seconds after the limit's reset before resuming
+AUTORESUME_RETRY = 600    # seconds between attempts on the same worker
+AUTORESUME_PROMPT = ("Your previous run stopped because the subscription usage limit was reached. The limit has "
+                     "reset: continue the task from where you left off.")
 
 libvirt.registerErrorHandler(lambda _ctx, _err: None, None)  # errors arrive as exceptions; don't also print them
 
@@ -145,6 +152,7 @@ class Sandbox:
         self._ssh_ip = ""
         self._docker: Any = None
         self._lock = threading.RLock()
+        self._autoresume_tried: Dict[str, float] = {}
         # git and rsync reach the VM with the dedicated key; nothing else gets these settings
         self.git_env = dict(os.environ)
         self.git_env["GIT_SSH_COMMAND"] = "ssh " + " ".join(shlex.quote(o) for o in self.ssh_cli_opts())
@@ -357,13 +365,16 @@ class Sandbox:
         return self._containers().get(name)
 
     def running_workers(self) -> List[str]:
-        return [n for n, c in self._containers().items() if c.status == "running"]
+        """Running or paused: a paused worker still holds its run."""
+        return [n for n, c in self._containers().items() if c.status in ("running", "paused")]
 
     @staticmethod
     def _status(c: Any) -> str:
         st = c.attrs.get("State", {})
         if c.status == "running":
             return f"running {since(st.get('StartedAt', ''))}"
+        if c.status == "paused":
+            return f"paused (started {since(st.get('StartedAt', ''))} ago)"
         if c.status == "exited":
             return f"exited ({st.get('ExitCode')}) {since(st.get('FinishedAt', ''))} ago"
         return c.status
@@ -691,13 +702,52 @@ class Sandbox:
             raise SandboxError(f"worker '{name}' is still running; stop it first or wait for it to finish")
         return self._launch(name, prompt, model, effort, resume=True)
 
-    def stop(self, name: str) -> str:
+    def live_container(self, name: str) -> Any:
+        """The worker's container, if it is running or paused."""
         self.need_worker(name)
         c = self._container(name)
-        if c is None or c.status != "running":
+        if c is None or c.status not in ("running", "paused"):
             raise SandboxError(f"worker '{name}' isn't running")
+        return c
+
+    def stop(self, name: str) -> str:
+        c = self.live_container(name)
+        if c.status == "paused":
+            c.unpause()  # a frozen process can't act on the stop signal
         c.stop()
         return f"stopped {name}"
+
+    def pause(self, name: str) -> str:
+        """Freeze a running worker in place (docker pause): it sends no API requests until unpause."""
+        c = self.live_container(name)
+        if c.status == "paused":
+            raise SandboxError(f"worker '{name}' is already paused")
+        c.pause()
+        return f"paused {name}"
+
+    def unpause(self, name: str) -> str:
+        c = self.live_container(name)
+        if c.status != "paused":
+            raise SandboxError(f"worker '{name}' isn't paused")
+        c.unpause()
+        return f"unpaused {name}"
+
+    def autoresume(self) -> List[str]:
+        """Resume (follow-up prompt, same model/effort) every exited worker whose latest run ended on the usage
+        limit, once that limit has reset. Call it periodically; returns what it did."""
+        now, msgs = time.time(), []
+        for w in self.workers():
+            lim, name = w.get("limited"), w["name"]
+            if w["state"] != "exited" or not lim or not lim.get("resetsAt") or now < lim["resetsAt"] + AUTORESUME_GRACE:
+                continue
+            if now - self._autoresume_tried.get(name, 0) < AUTORESUME_RETRY:
+                continue
+            self._autoresume_tried[name] = now
+            try:
+                msgs.append("auto-" + self.resume(name, AUTORESUME_PROMPT, w.get("run_model") or "", w.get("effort") or ""))
+            except SandboxError as e:
+                msgs.append(f"auto-resume {name} failed: {e}")
+        return msgs
 
     def rm(self, name: str) -> str:
         self._check_name(name)
@@ -730,6 +780,42 @@ class Sandbox:
         data = self.read_file(f"{WORKERS}/{name}/home/agent.jsonl", offset, limit)
         end = data.rfind(b"\n") + 1  # only complete lines; the rest arrives next poll
         return parse_events(data[:end].splitlines()), offset + end
+
+    def log_view(self, name: str, offset: Optional[int] = None, before: Optional[int] = None) -> Dict[str, Any]:
+        """A window of the worker's log for viewers that open on the newest events (see log_window)."""
+        self._check_name(name)
+        path = f"{WORKERS}/{name}/home/agent.jsonl"
+        with self.ssh().open_sftp() as sftp:
+            try:
+                size = sftp.stat(path).st_size
+            except FileNotFoundError:
+                size = 0
+
+            def read(off: int, n: int) -> bytes:
+                with sftp.open(path, "rb") as f:
+                    f.seek(off)
+                    f.prefetch(min(off + n, size))  # file_size: the absolute end
+                    return f.read(n)
+            return log_window(read, size, offset, before)
+
+    def orchestrator_sessions(self) -> List[Dict[str, Any]]:
+        """Claude Code sessions started in this folder (the orchestrator), newest first."""
+        d = claude_project_dir()
+        files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:30] if d.is_dir() else []
+        return [{"id": p.stem, "title": session_title(p), "mtime": p.stat().st_mtime} for p in files
+                if SESSION_RE.match(p.stem)]
+
+    def orchestrator_log(self, session: str, offset: Optional[int] = None, before: Optional[int] = None) -> Dict[str, Any]:
+        if not SESSION_RE.match(session or ""):
+            raise SandboxError(f"bad session id '{session}'")
+        path = claude_project_dir() / f"{session}.jsonl"
+        if not path.exists():
+            raise SandboxError(f"no session {session}")
+        with open(path, "rb") as f:
+            def read(off: int, n: int) -> bytes:
+                f.seek(off)
+                return f.read(n)
+            return log_window(read, path.stat().st_size, offset, before)
 
     def learnings(self, names: Iterable[str] = ()) -> str:
         parts = []
@@ -790,7 +876,55 @@ def tree_digest(root: Path) -> str:
     return hashlib.sha1(b"\n".join(sorted(entries))).hexdigest()
 
 
+def claude_project_dir() -> Path:
+    """Where Claude Code keeps transcripts of sessions started in this folder."""
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    return base / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(HERE))
+
+
+def session_title(path: Path) -> str:
+    """A transcript's newest custom or generated title, else its first prompt."""
+    title, first = "", ""
+    with open(path, "rb") as f:
+        for line in f:
+            if b'-title"' not in line and not (not first and b'"type":"user"' in line):
+                continue
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if m.get("type") in ("custom-title", "ai-title"):
+                title = m.get("customTitle") or m.get("aiTitle") or title
+            elif m.get("type") == "user" and not first and not m.get("isMeta"):
+                content = m.get("message", {}).get("content")
+                if isinstance(content, str) and not content.startswith("<"):
+                    first = content.strip().splitlines()[0][:80] if content.strip() else ""
+    return title or first
+
+
 # -------------------------------------------------------------------- log parsing
+
+def log_window(read: Callable[[int, int], bytes], size: int, offset: Optional[int] = None,
+               before: Optional[int] = None) -> Dict[str, Any]:
+    """Parsed events from one window of a stream-json log (complete lines only), for viewers that open on the
+    newest events. offset=N: from byte N on, to follow the log (`more`: a full window was read, ask again at once).
+    before=N: the window ending at byte N, to scroll back. Neither: the newest events.
+    Returns events, `start` (first byte covered; pass as before=) and `offset` (next byte; pass as offset=)."""
+    if offset is not None:
+        data = read(offset, WINDOW_BYTES) if offset < size else b""
+        end = data.rfind(b"\n") + 1
+        return {"events": parse_events(data[:end].splitlines()), "start": offset, "offset": offset + end,
+                "more": offset + end < size and len(data) == WINDOW_BYTES}
+    stop = size if before is None else max(0, min(before, size))
+    start = max(0, stop - (TAIL_BYTES if before is None else WINDOW_BYTES))
+    data = read(start, stop - start) if stop > start else b""
+    cut = data.find(b"\n") + 1 if start > 0 else 0  # drop the partial first line
+    if start > 0 and cut == 0:
+        return {"events": [], "start": start, "offset": stop, "more": False}  # one line longer than a window
+    end = data.rfind(b"\n") + 1
+    return {"events": parse_events(data[cut:end].splitlines()), "start": start + cut, "offset": start + end,
+            "more": False}
+
 
 def clip(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + f"… ({len(s) - n} more chars)"
@@ -817,8 +951,13 @@ def parse_events(lines: Iterable[bytes]) -> List[Dict[str, Any]]:
                                    "input": clip(json.dumps(c.get("input"), ensure_ascii=False), 4000), "ts": ts})
         elif t == "user":
             content = m.get("message", {}).get("content")
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
             for c in content if isinstance(content, list) else []:
-                if c.get("type") == "tool_result":
+                if c.get("type") == "text" and c.get("text", "").strip() and not m.get("isMeta") \
+                        and not m.get("parent_tool_use_id"):
+                    events.append({"kind": "prompt", "text": clip(c["text"], 6000), "ts": ts})
+                elif c.get("type") == "tool_result":
                     body = c.get("content")
                     if isinstance(body, list):
                         body = "\n".join(x.get("text", "") for x in body if isinstance(x, dict))
@@ -853,6 +992,8 @@ def format_event(e: Dict[str, Any], results: bool = False) -> Optional[str]:
         return f"  > {e['name']} {e['input'][:200]}"
     if k == "tool_result":
         return ("  < " + e["text"][:300].replace("\n", "\n    ")) if results else None
+    if k == "prompt":
+        return f">> {e['text']}"
     if k == "result":
         return f"== result: {e['subtype']} ({e.get('turns')} turns) {e['text'][:500]}"
     return f"-- {e['text']}"
@@ -864,7 +1005,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     for c in ("setup-host", "create", "build-image", "lockdown", "unlock", "check", "token", "sync", "start",
-              "shutdown", "ls", "status", "ghidra-forward"):
+              "shutdown", "ls", "status", "ghidra-forward", "autoresume"):
         sub.add_parser(c)
     sub.add_parser("destroy").add_argument("--yes", action="store_true")
     for c in ("spawn", "resume"):
@@ -874,7 +1015,7 @@ def main() -> int:
         p.add_argument("-f", "--file")
         p.add_argument("-m", "--model", default="", choices=MODELS, metavar="{" + ",".join(m for m in MODELS if m) + "}")
         p.add_argument("-e", "--effort", default="", choices=EFFORTS, metavar="{" + ",".join(e for e in EFFORTS if e) + "}")
-    for c in ("stop", "rm", "review", "diff"):
+    for c in ("stop", "pause", "unpause", "rm", "review", "diff"):
         sub.add_parser(c).add_argument("name")
     for c in ("fetch", "learnings"):
         sub.add_parser(c).add_argument("names", nargs="*")
@@ -895,6 +1036,7 @@ def main() -> int:
     p = sub.add_parser("portal", help="web portal (see portal.py --help)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--no-autoresume", action="store_true")
     args = ap.parse_args()
 
     try:
@@ -908,7 +1050,7 @@ def main() -> int:
             else:
                 prompt = " ".join(args.prompt)
             print(getattr(sb, c)(args.name, prompt, args.model, args.effort))
-        elif c in ("stop", "rm", "review", "diff"):
+        elif c in ("stop", "pause", "unpause", "rm", "review", "diff"):
             print(getattr(sb, c)(args.name))
         elif c in ("fetch", "learnings"):
             print(getattr(sb, c)(args.names))
@@ -953,13 +1095,22 @@ def main() -> int:
                               f"decomp@{sb.need_ip()}", *args.command])
         elif c == "ghidra-forward":
             sb.ghidra_forward()
+        elif c == "autoresume":
+            print("resuming workers stopped by the usage limit once it resets (Ctrl-C to stop)", flush=True)
+            while True:
+                try:
+                    for m in sb.autoresume():
+                        print(m, flush=True)
+                except SandboxError as e:
+                    print(f"sandbox: {e}", file=sys.stderr, flush=True)
+                time.sleep(60)
         elif c == "destroy":
             if not args.yes and input(f"Delete VM {sb.vm} and all worker data? [y/N] ").strip() != "y":
                 return 1
             print(sb.destroy())
         elif c == "portal":
             from portal import serve
-            serve(sb, args.host, args.port)
+            serve(sb, args.host, args.port, not args.no_autoresume)
         else:
             print(getattr(sb, c.replace("-", "_"))())
     except SandboxError as e:

@@ -17,10 +17,11 @@ MCP server (`mcp__sandbox__*`, backed by `sandbox.py` in this repo). Details and
 | `vm_status` / `check` | VM up and locked down; `check` proves it. Run `check` before a batch |
 | `sync` | Push the user's committed HEAD to the VM as `base` |
 | `spawn(name, prompt, model)` | Start a worker (model: default, sonnet, opus, haiku, fable) |
-| `workers` | Every worker: state, model, prompt, final result with turns and cost |
+| `workers` | Every worker: state, model, prompt, final result with turns and cost, newest message, `limited` (run ended on the usage limit) |
 | `log(name, offset)` | New events since `offset` (pass the returned offset back); `results=true` adds tool outputs |
 | `resume(name, prompt)` | Follow-up for a finished worker: it continues its own session in its clone |
 | `stop(name)` | Stop a running worker |
+| `pause(name)` / `unpause(name)` | Freeze a worker in place (no API requests) / continue it exactly where it was |
 | `fetch(names)` / `review(name)` / `diff(name)` | Pull worker branches to `sandbox/<name>`, then inspect them |
 | `learnings(names)` | Idioms workers proposed in `~/learnings.md` (outside their repos) |
 | `remove(name)` | Delete a worker (fetch first) |
@@ -67,6 +68,9 @@ or anything that pushes.
 ## Rules
 
 - Don't spawn if `check` fails.
+- When session usage is close to the limit, `pause` workers rather than letting them all hit it; `unpause` after
+  the reset. A worker whose run ended on the limit shows `limited` in `workers`; the portal resumes it after the
+  reset (when its auto-resume is on), so don't `resume` it yourself before `limited.resetsAt`.
 - Keep concurrency within VM capacity: about `VM_CPUS / WORKER_CPUS`, which defaults to 4.
 - Workers only see what `sync` pushed (committed HEAD). If the user wants new commits included, ask
   them to commit, then run `sync` before spawning.
