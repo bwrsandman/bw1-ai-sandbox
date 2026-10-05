@@ -19,7 +19,7 @@ toolchain = ["build/tools", "build/compilers"]
 # Read-only data copied into the VM, mounted in workers at `mount` and linked from the repo as `link`.
 # verify: compare file names and sizes after copying.
 [project.data]
-source = "bw1-build/orig"
+source = "bw1-decomp/orig"          # the files you supply, see README "Setup"
 mount = "/opt/orig"
 link = "orig"
 verify = true

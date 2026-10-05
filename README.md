@@ -2,7 +2,7 @@
 
 Runs several `claude -p --dangerously-skip-permissions` decomp workers at once, each in its own container inside a
 dedicated libvirt/KVM VM, for [bw1-decomp](https://github.com/openblack/bw1-decomp). Install the host dependencies below,
-clone this repo and the project repos into it, then run the scripts.
+clone this repo and the project into it, then run the scripts.
 
 > [!CAUTION]
 > **Its security features are best effort. Do not rely on them to protect anything.**
@@ -39,11 +39,11 @@ bw1-ai-sandbox/            ← this repo
     preamble.md            prepended to every worker prompt
     local/                 (you create, ignored) MCP config + bridge for workers, see "Ghidra MCP"
     bw1-decomp/            (you clone, ignored) the project: sync sends its checked-out HEAD to workers
-    bw1-build/             (you clone, ignored) provides orig/
+        orig/              (you supply, ignored by bw1-decomp) original game files, copied read-only to workers
 ```
 
-You maintain `bw1-decomp/` and `bw1-build/` like any clone (your remotes, your branches). The sandbox only reads from
-them, except `fetch`, which adds worker branches to `bw1-decomp/` as `sandbox/<name>`.
+You maintain `bw1-decomp/` like any clone (your remotes, your branches). The sandbox only reads from it, except
+`fetch`, which adds worker branches to it as `sandbox/<name>`.
 
 ## Setup
 
@@ -68,10 +68,15 @@ Read the warning at the top first.
 ```sh
 git clone <your server>/bw1-ai-sandbox && cd bw1-ai-sandbox
 git clone git@github.com:openblack/bw1-decomp.git     # then add your own remotes
-git clone <bw1-build url> bw1-build                   # provides the original game files under orig/
 ```
 
-Both clones live inside this folder and are ignored by git.
+The clone lives inside this folder and is ignored by git.
+
+Then put the original game files in `bw1-decomp/orig/` as bw1-decomp's
+[Getting Started](https://github.com/openblack/bw1-decomp/blob/main/docs/getting_started.md) describes (game binary
+and DLLs, MSVC 6.0 libs, DirectX 7.0 DDK, Intel libraries). None of it is downloadable; you supply it. `sync` copies
+that folder into the VM, and workers see it read-only as `orig/`. `orig/` may be a symlink to wherever you keep them.
+To read them from somewhere else, set `source` under `[project.data]` in `sandbox.toml`.
 
 ### 3. Build the toolchain on the host
 
@@ -137,7 +142,7 @@ Then update `sandbox.toml` before syncing:
 - In `[worker].setup`, add `"--version", "BW1W100"` immediately after `"configure.py"`, retaining all other arguments.
   Configuring the host checkout alone does not select the workers' version; without this argument they default to 1.2.
 - In `[project.data]`, set `required = "BW1W100/runblack-decrypted.exe"`. The data source must contain that version's
-  original files (by default under `bw1-build/orig/BW1W100/`).
+  original files (by default under `bw1-decomp/orig/BW1W100/`).
 
 Use `BW1W110` in both settings for version 1.1. After completing VM setup, run `./sandbox.py sync` to copy the
 toolchain and data before spawning workers.
