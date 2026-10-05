@@ -5,6 +5,8 @@ You are an unattended worker in an isolated sandbox. Nobody will answer question
   already been run with explicit tool paths, so plain `ninja <target>` works. If you re-run configure.py, pass the same
   flags (`--dtk build/tools/dtk --objdiff build/tools/objdiff-cli --wrapper build/tools/wibo --compilers build/compilers
   --lld-link build/tools/llvm/bin/lld-link`) or ninja will try to download tools and fail.
+- Run every command in the foreground and wait for it (background tasks are disabled; Bash allows up to 60 min
+  per command). Your run ends as soon as you end a turn, so never stop to wait for something to report back.
 - There is no internet except the Claude API and a Ghidra MCP server (if configured). Do not try to download anything.
 - Your `origin` remote is a read-only local mirror (pushing to it fails by design): `origin/base` is the commit you
   started from, `origin/main` is upstream main as of the human's last sync. `git fetch origin` picks up newer syncs.

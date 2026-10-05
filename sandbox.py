@@ -11,6 +11,7 @@ the sudo disk steps (create/destroy), and ssh for interactive terminals (shell/s
 """
 
 import argparse
+import contextlib
 import hashlib
 import io
 import json
@@ -29,7 +30,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import libvirt
 import paramiko
@@ -56,8 +57,14 @@ WINDOW_BYTES = 2_000_000  # then follows / scrolls back in windows of this size
 SESSION_RE = re.compile(r"^[0-9a-f-]{36}$")
 AUTORESUME_GRACE = 60     # seconds after the limit's reset before resuming
 AUTORESUME_RETRY = 600    # seconds between attempts on the same worker
+AUTORESUME_WINDOW = 3 * 3600  # only resets this recent: an older limit hit is a worker you've moved on from
+# exec/sftp channels open at once on the pooled connection. sshd allows 10 (MaxSessions); docker's pool takes 3
+# (dockervm.POOL_SIZE), and the rest is headroom.
+CHANNELS = 5
 AUTORESUME_PROMPT = ("Your previous run stopped because the subscription usage limit was reached. The limit has "
-                     "reset: continue the task from where you left off.")
+                     "reset, but time has passed: `git fetch origin` and check whether `origin/main` has moved and "
+                     "whether you need to rebase onto it (your task says whether to track it; upstream may also have "
+                     "touched what you're working on). Then continue the task from where you left off.")
 
 libvirt.registerErrorHandler(lambda _ctx, _err: None, None)  # errors arrive as exceptions; don't also print them
 
@@ -132,15 +139,6 @@ def out(p: subprocess.CompletedProcess) -> str:
     return p.stdout.decode(errors="replace").strip()
 
 
-def since(iso: str) -> str:
-    """Docker timestamp -> '12 min' (the human-readable status string isn't part of the API)."""
-    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", iso or "")
-    if not m or iso.startswith("0001"):
-        return "?"
-    s = int((datetime.now(timezone.utc) - datetime.fromisoformat(m.group(1) + "+00:00")).total_seconds())
-    return f"{s}s" if s < 90 else f"{s // 60} min" if s < 5400 else f"{s // 3600} h" if s < 172800 else f"{s // 86400} d"
-
-
 class Sandbox:
     def __init__(self, cfg: Optional[Config] = None):
         self.cfg = cfg or Config.load()
@@ -153,6 +151,7 @@ class Sandbox:
         self._docker: Any = None
         self._lock = threading.RLock()
         self._autoresume_tried: Dict[str, float] = {}
+        self._channels = threading.BoundedSemaphore(CHANNELS)
         # git and rsync reach the VM with the dedicated key; nothing else gets these settings
         self.git_env = dict(os.environ)
         self.git_env["GIT_SSH_COMMAND"] = "ssh " + " ".join(shlex.quote(o) for o in self.ssh_cli_opts())
@@ -282,16 +281,43 @@ class Sandbox:
             self._push_bin(client)  # every new connection: the VM never runs an older helper than this code
             return client
 
+    def _open(self, opener: Callable[[paramiko.Transport], Any]) -> Any:
+        """Open a channel (session or sftp). If sshd refuses it (its per-connection channel limit), wait for one to
+        free up; if it still refuses, channels leaked on this connection: start a fresh one (which closes them, and
+        anything in flight on it) and try a last time."""
+        for attempt in (1, 2, 3):
+            try:
+                return opener(self.ssh().get_transport())
+            except paramiko.SSHException as e:  # includes ChannelException
+                if attempt == 3:
+                    raise SandboxError(f"ssh channel to VM failed: {e}")
+                if attempt == 1 and isinstance(e, paramiko.ChannelException):
+                    time.sleep(1)
+                else:
+                    self._drop_ssh()
+
+    @contextlib.contextmanager
+    def sftp(self) -> Iterator[paramiko.SFTPClient]:
+        with self._channels:
+            client = self._open(paramiko.SFTPClient.from_transport)
+            try:
+                yield client
+            finally:
+                client.close()
+
     def exec(self, argv: List[str], stdin: bytes = b"", check: bool = True) -> Tuple[int, bytes, bytes]:
         """Run a program in the VM (argv, quoted for the remote login shell)."""
-        chan = self.ssh().get_transport().open_session()
-        chan.exec_command(shlex.join(argv))
-        if stdin:
-            chan.sendall(stdin)
-        chan.shutdown_write()
-        stdout, stderr = chan.makefile("rb").read(), chan.makefile_stderr("rb").read()
-        code = chan.recv_exit_status()
-        chan.close()
+        with self._channels:
+            chan = self._open(lambda t: t.open_session())
+            try:
+                chan.exec_command(shlex.join(argv))
+                if stdin:
+                    chan.sendall(stdin)
+                chan.shutdown_write()
+                stdout, stderr = chan.makefile("rb").read(), chan.makefile_stderr("rb").read()
+                code = chan.recv_exit_status()
+            finally:
+                chan.close()
         if check and code != 0:
             raise SandboxError(f"{argv[0]} failed in VM ({code}): {stderr.decode(errors='replace').strip()[-800:]}")
         return code, stdout, stderr
@@ -309,7 +335,7 @@ class Sandbox:
         return json.loads(stdout)
 
     def read_file(self, path: str, offset: int = 0, limit: int = 2_000_000) -> bytes:
-        with self.ssh().open_sftp() as sftp:
+        with self.sftp() as sftp:
             try:
                 with sftp.open(path, "rb") as f:
                     f.seek(offset)
@@ -359,7 +385,9 @@ class Sandbox:
             return self._docker
 
     def _containers(self) -> Dict[str, Any]:
-        return {c.name[2:]: c for c in self.docker.containers.list(all=True, filters={"name": "^w-"})}
+        # sparse: one list request, not one inspect per container
+        found = self.docker.containers.list(all=True, sparse=True, filters={"name": "^w-"})
+        return {c.attrs["Names"][0].lstrip("/")[2:]: c for c in found}
 
     def _container(self, name: str) -> Any:
         return self._containers().get(name)
@@ -370,13 +398,16 @@ class Sandbox:
 
     @staticmethod
     def _status(c: Any) -> str:
-        st = c.attrs.get("State", {})
+        """From docker's list summary: 'Up 24 minutes', 'Up 2 minutes (Paused)', 'Exited (1) 13 hours ago'."""
+        text = c.attrs.get("Status", "").replace("Less than", "less than").replace("About a", "about a")
         if c.status == "running":
-            return f"running {since(st.get('StartedAt', ''))}"
+            return "running " + text.removeprefix("Up ")
         if c.status == "paused":
-            return f"paused (started {since(st.get('StartedAt', ''))} ago)"
+            return f"paused (up {text.removeprefix('Up ').removesuffix(' (Paused)')})"
         if c.status == "exited":
-            return f"exited ({st.get('ExitCode')}) {since(st.get('FinishedAt', ''))} ago"
+            return text[:1].lower() + text[1:]
+        if c.status == "created":
+            return "never started (resume it, or remove it)"
         return c.status
 
     # ---------------------------------------------------------------- VM lifecycle
@@ -628,7 +659,7 @@ class Sandbox:
             raise SandboxError(f"bad name '{name}' (letters, digits, - and _)")
 
     def worker_names(self) -> List[str]:
-        with self.ssh().open_sftp() as sftp:
+        with self.sftp() as sftp:
             return sorted(sftp.listdir(WORKERS))
 
     def need_worker(self, name: str) -> None:
@@ -636,7 +667,7 @@ class Sandbox:
         if name not in self.worker_names():
             raise SandboxError(f"no worker '{name}' (create it with: sandbox.py spawn {name} \"prompt\")")
 
-    def _launch(self, name: str, prompt: str, model: str, effort: str, resume: bool) -> str:
+    def _launch(self, name: str, prompt: str, model: str, effort: str, resume: bool, mode: str = "") -> str:
         if not self.locked():
             raise SandboxError("refusing to start a worker: VM not locked down")
         if model not in MODELS:
@@ -657,8 +688,8 @@ class Sandbox:
             preamble = self.cfg.preamble.read_text() if self.cfg.preamble.exists() else ""
             self.agent("prepare", name=name, ref="base", prompt=preamble + text, toolchain=self.cfg.toolchain,
                        tree=SHARED_TREE, data_link=self.cfg.data_link, data_mount=self.cfg.data_mount)
-        mode = "resume" if resume else "new"
-        self.agent("record_run", name=name, run={"model": model, "effort": effort, "mode": mode,
+        self.agent("record_run", name=name, run={"model": model, "effort": effort,
+                                                 "mode": mode or ("resume" if resume else "new"),
                                                  "started": datetime.now(timezone.utc).isoformat(timespec="seconds")})
         w = f"{WORKERS}/{name}"
         api = (self.api_ips() or [FALLBACK_API_IP])[0]
@@ -670,7 +701,12 @@ class Sandbox:
                 pids_limit=2048, nano_cpus=int(self.cfg.worker_cpus * 1e9), mem_limit=self.cfg.worker_mem,
                 dns=["127.0.0.1"], extra_hosts={"api.anthropic.com": api, "ghidra.host": self.host_ip()},
                 environment={**token, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_AUTOUPDATER": "1",
-                             "WORKER_MODEL": model, "WORKER_EFFORT": effort, "WORKER_MODE": mode,
+                             # headless: `claude -p` exits when a turn ends, so a background task's result would
+                             # never arrive ("I'll continue once it reports", then the run is over). Builds run in
+                             # the foreground instead, with room for long ones.
+                             "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+                             "BASH_DEFAULT_TIMEOUT_MS": "1200000", "BASH_MAX_TIMEOUT_MS": "3600000",
+                             "WORKER_MODEL": model, "WORKER_EFFORT": effort, "WORKER_MODE": "resume" if resume else "new",
                              "WORKER_SETUP": json.dumps(self.cfg.setup)},
                 # the entrypoint comes from /srv/decomp/bin (pushed every spawn), so it changes without a rebuild
                 volumes={
@@ -685,8 +721,14 @@ class Sandbox:
                     SHARED_MCP: {"bind": "/opt/mcp", "mode": "ro"},
                 })
         except Exception as e:
+            # never leave a half-made worker: a container that was created but not started, or (new worker) the clone
+            with contextlib.suppress(Exception):
+                c = self._container(name)
+                if c is not None:
+                    c.remove(force=True)
             if not resume:
-                self.agent("rm", name=name)  # never leave a half-made worker (it would block a retry)
+                with contextlib.suppress(Exception):
+                    self.agent("rm", name=name)
             raise SandboxError(f"starting container failed: {e}")
         extra = " · ".join(x for x in (model and f"model {model}", effort and f"effort {effort}") if x)
         return f"{'resumed' if resume else 'spawned'} w-{name} on agent/{name}" + (f" ({extra})" if extra else "")
@@ -695,12 +737,12 @@ class Sandbox:
         self._check_name(name)
         return self._launch(name, prompt, model, effort, resume=False)
 
-    def resume(self, name: str, prompt: str, model: str = "", effort: str = "") -> str:
+    def resume(self, name: str, prompt: str, model: str = "", effort: str = "", mode: str = "") -> str:
         """Follow-up prompt for a finished worker: continues its Claude session in the same clone."""
         self.need_worker(name)
         if name in self.running_workers():
             raise SandboxError(f"worker '{name}' is still running; stop it first or wait for it to finish")
-        return self._launch(name, prompt, model, effort, resume=True)
+        return self._launch(name, prompt, model, effort, resume=True, mode=mode)
 
     def live_container(self, name: str) -> Any:
         """The worker's container, if it is running or paused."""
@@ -734,18 +776,21 @@ class Sandbox:
 
     def autoresume(self) -> List[str]:
         """Resume (follow-up prompt, same model/effort) every exited worker whose latest run ended on the usage
-        limit, once that limit has reset. Call it periodically; returns what it did."""
+        limit, once that limit has reset (and only for a recent reset). Call it periodically; returns what it did."""
         now, msgs = time.time(), []
         for w in self.workers():
             lim, name = w.get("limited"), w["name"]
-            if w["state"] != "exited" or not lim or not lim.get("resetsAt") or now < lim["resetsAt"] + AUTORESUME_GRACE:
+            if w["state"] not in ("exited", "created") or not lim or not lim.get("resetsAt"):
+                continue
+            if not lim["resetsAt"] + AUTORESUME_GRACE <= now <= lim["resetsAt"] + AUTORESUME_WINDOW:
                 continue
             if now - self._autoresume_tried.get(name, 0) < AUTORESUME_RETRY:
                 continue
             self._autoresume_tried[name] = now
             try:
-                msgs.append("auto-" + self.resume(name, AUTORESUME_PROMPT, w.get("run_model") or "", w.get("effort") or ""))
-            except SandboxError as e:
+                msgs.append("auto-" + self.resume(name, AUTORESUME_PROMPT, w.get("run_model") or "", w.get("effort") or "",
+                                                  mode="auto"))
+            except Exception as e:  # one worker failing must not skip the others
                 msgs.append(f"auto-resume {name} failed: {e}")
         return msgs
 
@@ -785,7 +830,7 @@ class Sandbox:
         """A window of the worker's log for viewers that open on the newest events (see log_window)."""
         self._check_name(name)
         path = f"{WORKERS}/{name}/home/agent.jsonl"
-        with self.ssh().open_sftp() as sftp:
+        with self.sftp() as sftp:
             try:
                 size = sftp.stat(path).st_size
             except FileNotFoundError:
@@ -1037,6 +1082,7 @@ def main() -> int:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--no-autoresume", action="store_true")
+    p.add_argument("--pants-down-mode", dest="insecure", action="store_true")
     args = ap.parse_args()
 
     try:
@@ -1110,7 +1156,7 @@ def main() -> int:
             print(sb.destroy())
         elif c == "portal":
             from portal import serve
-            serve(sb, args.host, args.port, not args.no_autoresume)
+            serve(sb, args.host, args.port, not args.no_autoresume, args.insecure)
         else:
             print(getattr(sb, c.replace("-", "_"))())
     except SandboxError as e:

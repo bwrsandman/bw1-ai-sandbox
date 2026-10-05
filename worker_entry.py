@@ -3,6 +3,7 @@
 run the task headless, snapshot-commit whatever is left.
 
 WORKER_MODE=resume continues the previous Claude session with /task/followup.md; the log is appended to.
+If the log has no session (the first run never started), it starts one with the task followed by the follow-up.
 WORKER_MODEL / WORKER_EFFORT select model and effort ('' = Claude Code's default).
 WORKER_SETUP is the setup command (JSON argv list, from sandbox.toml [worker] setup), run once for a new worker.
 """
@@ -40,24 +41,23 @@ def main() -> int:
     if os.environ.get("WORKER_EFFORT"):
         args += ["--effort", os.environ["WORKER_EFFORT"]]
 
-    if os.environ.get("WORKER_MODE") == "resume":
-        session = first_session_id()
-        if not session:
-            with open(ERR, "a") as err:
-                err.write("no session to resume\n")
-            return 1
+    session = first_session_id() if os.environ.get("WORKER_MODE") == "resume" else ""
+    if session:
         args += ["--resume", session]
-        prompt = Path("/task/followup.md")
+        prompt = Path("/task/followup.md").read_bytes()
     else:
         setup = json.loads(os.environ.get("WORKER_SETUP") or "[]")
         if setup:
             with open(HOME / "setup.log", "w") as log:
                 if subprocess.run(setup, stdout=log, stderr=subprocess.STDOUT).returncode != 0:
                     print("setup command failed, see ~/setup.log", file=sys.stderr)
-        prompt = Path("/task/prompt.md")
+        prompt = Path("/task/prompt.md").read_bytes()
+        if os.environ.get("WORKER_MODE") == "resume":
+            # the first run never started (no session in the log): start now, with the follow-up after the task
+            prompt += b"\n\n" + Path("/task/followup.md").read_bytes()
 
-    with open(prompt, "rb") as stdin, open(LOG, "ab") as stdout, open(ERR, "ab") as stderr:
-        status = subprocess.run(args, stdin=stdin, stdout=stdout, stderr=stderr).returncode
+    with open(LOG, "ab") as stdout, open(ERR, "ab") as stderr:
+        status = subprocess.run(args, input=prompt, stdout=stdout, stderr=stderr).returncode
 
     dirty = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
     if dirty:

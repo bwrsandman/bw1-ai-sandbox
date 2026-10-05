@@ -4,6 +4,28 @@ Runs several `claude -p --dangerously-skip-permissions` decomp workers at once, 
 dedicated libvirt/KVM VM, for [bw1-decomp](https://github.com/openblack/bw1-decomp). Install the host dependencies below,
 clone this repo and the project repos into it, then run the scripts.
 
+> [!CAUTION]
+> **Its security features are best effort. Do not rely on them to protect anything.**
+>
+> It is a personal tool for one person's machine. Nothing in it has been audited, reviewed, or tested against an
+> attacker. Use it only on a machine and network you control, and only if you accept that it may expose them.
+>
+> - **Agents run unsupervised with `--dangerously-skip-permissions`.** They execute any command they decide to,
+>   without asking anyone.
+> - **`--pants-down-mode` removes all of the portal's protection.** By default the portal listens on
+>   localhost only, over HTTPS, behind an access token. With this flag it has no login and no encryption, and it
+>   listens on any `--host`. Anyone who can reach its port can then spawn, resume, stop and delete workers, spend
+>   your Claude subscription, and read every worker log and orchestrator transcript. `--host 0.0.0.0` offers all of
+>   that to every network your machine is on.
+> - **The isolation is best effort, not a security boundary.** The VM, the network filter and the container settings
+>   described under [Threat model](#threat-model) are what the scripts *try* to do, not guarantees. A bug in them, in
+>   libvirt, QEMU/KVM, Docker or the kernel, or a simple misconfiguration, can give an agent your host or your network.
+> - **Your Claude OAuth token is inside the VM**, in every worker's environment, where any agent can read it.
+> - **Agents can write to your Ghidra project** through MCP, and the VM is allowed to reach the Ghidra port on your
+>   host.
+>
+> No warranty of any kind. If you need real isolation, use a disposable machine you can wipe.
+
 ## Layout
 
 ```
@@ -24,31 +46,71 @@ them, except `fetch`, which adds worker branches to `bw1-decomp/` as `sandbox/<n
 
 ## Setup
 
+Read the warning at the top first.
+
+### 1. Host requirements
+
+- Linux with KVM (`/dev/kvm`), `sudo`, and room for the VM (8 CPUs, 16 GB RAM and a 20 GB disk by default; change
+  them under `[vm]` in `sandbox.toml`).
+- Python ≥ 3.11.
+- Packages (Arch): `libvirt`, `qemu-base`, `virt-install`, `edk2-ovmf`, `dnsmasq`, `libvirt-python`,
+  `python-paramiko`, `python-docker`, `rsync`, `git`, `ninja`.
+  - `dnsmasq` provides DHCP and DNS for libvirt's default network; `libvirt-python` provides the Python bindings used
+    by the scripts.
+  - `virt-install` is a separate package; installing libvirt alone does not provide it.
+- [Claude Code](https://docs.claude.com/en/docs/claude-code) on the host, signed in to a subscription, to generate the
+  workers' token with `claude setup-token`.
+- Your user in the `libvirt` group (or equivalent), so the scripts can talk to libvirt without sudo.
+
+### 2. Clone this repo and the project
+
 ```sh
 git clone <your server>/bw1-ai-sandbox && cd bw1-ai-sandbox
 git clone git@github.com:openblack/bw1-decomp.git     # then add your own remotes
-git clone <bw1-build url> bw1-build
-# Default: version 1.2. For another version, follow "Choosing the game version" below before syncing.
-(cd bw1-decomp && python3 configure.py --version BW1W120 && ninja build/tools/dtk build/compilers/MSVC/6.5)
-
-./sandbox.py setup-host        # enable libvirt (sudo, once)
-./sandbox.py create            # VM + worker image + lockdown (skip if the VM already exists)
-./sandbox.py token             # paste `claude setup-token` output
-./sandbox.py sync
+git clone <bw1-build url> bw1-build                   # provides the original game files under orig/
 ```
 
-Host packages (Arch): `libvirt`, `qemu-base`, `virt-install`, `edk2-ovmf`, `dnsmasq`, `libvirt-python`, `python-paramiko`,
-`python-docker`, `rsync`, `git`. Python ≥ 3.11.
+Both clones live inside this folder and are ignored by git.
 
-`dnsmasq` provides DHCP and DNS for libvirt's default network; `libvirt-python` provides the Python bindings used by
-the scripts.
+### 3. Build the toolchain on the host
 
-`virt-install` is a separate package; installing libvirt alone does not provide it. If `create` reports it missing:
+Workers have no internet, so the host downloads the tools and compiler once and `sync` copies them into the VM.
+Default (game version 1.2):
 
 ```sh
-sudo pacman -S virt-install
-./sandbox.py create
+(cd bw1-decomp && python3 configure.py --version BW1W120 && ninja build/tools/dtk build/compilers/MSVC/6.5)
 ```
+
+For another version, follow [Choosing the game version](#choosing-the-game-version) instead.
+
+### 4. Create the VM
+
+```sh
+./sandbox.py setup-host        # enable libvirt's sockets and default network (sudo, once per host)
+./sandbox.py create            # download Debian, create the VM, build the worker image, lock the network down
+./sandbox.py token             # paste the output of `claude setup-token`
+./sandbox.py sync              # send bw1-decomp's checked-out HEAD, toolchain, data and local/ to the VM
+./sandbox.py check             # confirm the VM reaches the Anthropic API and nothing else
+```
+
+`create` asks for sudo for the disk image steps. Skip it if the VM already exists. If it reports `virt-install`
+missing, install it (`sudo pacman -S virt-install`) and run `create` again.
+
+The ssh key, known_hosts and Claude token are kept in `~/.local/share/bw1-sandbox` (`state_dir` in `sandbox.toml`),
+outside this repo.
+
+### 5. Optional: Ghidra MCP
+
+To give workers Ghidra, set up `local/` as described under [Ghidra MCP](#ghidra-mcp), then run `sync` again.
+
+### 6. First worker
+
+```sh
+./sandbox.py spawn farmer "Follow the decomp-matching skill for unit VillagerFarmer." -m opus -e high
+./sandbox.py logs farmer
+```
+
+See [Everyday use](#everyday-use) for the rest.
 
 ### Choosing the game version
 
@@ -125,7 +187,7 @@ for files and logs), the Docker SDK over it. External programs remain only where
 | Front end | For |
 |---|---|
 | `./sandbox.py <command>` | you, in a terminal |
-| `./portal.py [--host VPN_IP]` | you, in a browser or on your phone: live logs, spawn, stop, follow-ups, review, diff, usage |
+| `./portal.py` | you, in a browser or on your phone: live logs, spawn, stop, follow-ups, review, diff, usage |
 | `mcp_server.py` (via `.mcp.json`) | an orchestrator Claude session started in this folder (tools `mcp__sandbox__*`) |
 
 VM lifecycle (`create`, `unlock`, `destroy`) and `take` exist only in the CLI, so neither the portal nor an agent can
@@ -143,7 +205,7 @@ autoresume                                   loop: resume workers stopped by the
 fetch [NAME...] | review NAME | diff NAME | take NAME [BRANCH] | learnings [NAME...]
 unlock | build-image | lockdown              update the worker image (Claude Code version, packages)
 ghidra-forward                               forward the VM-visible host IP to Ghidra on 127.0.0.1
-ssh [CMD] | portal [--host H] [--port P]
+ssh [CMD] | portal [--host H] [--port P] [--pants-down-mode]
 ```
 
 Settings live in `sandbox.toml`; `SANDBOX_CONFIG=/path/to/other.toml` selects another file.
@@ -151,23 +213,43 @@ Settings live in `sandbox.toml`; `SANDBOX_CONFIG=/path/to/other.toml` selects an
 ## Portal
 
 ```sh
-./portal.py                      # prints http://127.0.0.1:8765/
-./portal.py --host 100.x.y.z     # your VPN address, for the phone
+./portal.py                      # prints https://127.0.0.1:8765/?token=...
 ```
 
-Open the printed URL directly; no token or login is required. Anyone who can reach the portal can use its controls
-and read the orchestrator's transcripts. Only bind an address reachable over your VPN: the portal is plain HTTP and can
-spawn and stop workers (inside the locked VM), but can't unlock the network or push.
+The portal is secure by default:
 
-- **Logs** open on the newest events (with timestamps); *Load earlier* walks back through the log.
+- **Localhost only.** It refuses any `--host` other than `127.0.0.1`, `localhost` or `::1`. To use it from your phone
+  or another computer, forward the port instead of exposing it, e.g. `ssh -L 8765:127.0.0.1:8765 your-pc`, or a
+  reverse proxy you trust on your VPN.
+- **HTTPS** with a self-signed certificate made on first start (`portal_cert.pem` and `portal_key.pem` in the state
+  dir). Your browser warns about it once: accept it only if the SHA-256 fingerprint matches the one printed at startup.
+  Delete both files to make a new certificate.
+- **Access token.** Open the printed URL once; it sets a cookie (HttpOnly, Secure, SameSite=Strict) and drops the token
+  from the address bar. Every page and API request without it gets 403. The token is kept in the state dir as
+  `portal_token`; delete it and restart the portal to rotate it, which also logs out every browser.
+
+Even with all three, anyone holding the token can spawn and stop workers (inside the locked VM), but can't unlock the
+network or push.
+
+> [!WARNING]
+> `./portal.py --pants-down-mode` turns off **all three**: no token, plain HTTP, and any `--host`
+> (`--host 0.0.0.0` for every interface). Anyone who can reach the port controls your workers and reads everything
+> they and the orchestrator have written. Use it only on a network where you trust every device.
+
+- **Logs** open on the newest events; *Load earlier* walks back through the log. Times are 24-hour, in the browser's
+  time zone; pick another under *Overview* (a browser that hides its zone reports UTC).
+- **Resume** continues a finished or stopped worker's session ("continue where you left off") with its last model and
+  effort; the follow-up form below it takes your own prompt. A worker shown as *never started* (its container was
+  created but not started) is resumed the same way.
 - **Pause** freezes a worker in place (`docker pause`): it sends no API requests until *Unpause*. Its process, open
   files and in-flight tool calls stay as they were; a request that was streaming when frozen is retried by Claude Code.
 - **Stop** runs in the background, so you can stop several workers in a row without waiting for each.
 - **Overview** shows every worker at once: state, settings, cost, and its newest message.
 - **Orchestrator** shows the transcripts of Claude Code sessions started in this folder (newest first, read-only).
 - **Auto-resume** (header checkbox; on at startup unless `--no-autoresume`): a worker whose run ended on the subscription usage limit gets a
-  follow-up ("the limit has reset, continue") with the same model and effort, a minute after the limit's reset time.
-  Workers you stopped or paused are never touched. Without the portal, `./sandbox.py autoresume` does the same.
+  follow-up ("the limit has reset, continue") with the same model and effort, a minute after the limit's reset time,
+  and only within 3 hours of it (an older limit hit is left alone). Its runs are recorded as `"mode": "auto"` in the
+  worker's `runs.jsonl`. Workers you stopped or paused are never touched. Without the portal, `./sandbox.py autoresume` does the same.
 
 ## Orchestrator
 

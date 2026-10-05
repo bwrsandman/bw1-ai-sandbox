@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""Web portal for the sandbox: live worker logs and control (stdlib only).
+"""Web portal for the sandbox: live worker logs and control (stdlib, plus paramiko's `cryptography` for the
+certificate).
 
-  ./portal.py                                           # http://127.0.0.1:8765
-  ./portal.py --host 0.0.0.0     # bind your VPN address to use it from a phone
+  ./portal.py                                           # https://127.0.0.1:8765/?token=...
+  ./portal.py --pants-down-mode --host 0.0.0.0   # no token, no TLS, every interface: see README
 
-Open the URL printed at startup; the portal has no authentication.
+By default the portal listens on localhost only, over HTTPS with a self-signed certificate (fingerprint printed at
+startup), and needs the token in the printed URL (stored in the state dir as portal_token; opening the URL once sets a
+cookie). Reach it from another device by forwarding the port. --pants-down-mode turns all three off.
 VM lifecycle (create/unlock/destroy) and `take` are CLI-only on purpose.
 """
 
 import argparse
+import datetime
+import hmac
+import ipaddress
 import json
+import os
+import secrets
+import ssl
 import sys
 import threading
 import time
+from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,7 +33,63 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sandbox import EFFORTS, MODELS, Sandbox, SandboxError  # noqa: E402
 
 
-def make_handler(sb: Sandbox, autoresume: bool = True) -> type:
+COOKIE = "sbportal"
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+INSECURE_FLAG = "--pants-down-mode"
+
+
+def _private_file(path: Path, data: bytes) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
+def load_token(sb: Sandbox) -> str:
+    path = sb.state / "portal_token"
+    if not path.exists():
+        sb.state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _private_file(path, secrets.token_urlsafe(24).encode())
+    return path.read_text().strip()
+
+
+def load_cert(sb: Sandbox) -> Tuple[Path, Path, str]:
+    """Self-signed certificate for localhost, made once (delete portal_cert.pem to replace it): cert, key, fingerprint."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    cert_path, key_path = sb.state / "portal_cert.pem", sb.state / "portal_key.pem"
+    if not (cert_path.exists() and key_path.exists()):
+        sb.state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"{sb.vm} portal")])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - datetime.timedelta(minutes=5)).not_valid_after(now + datetime.timedelta(days=3650))
+                .add_extension(x509.SubjectAlternativeName([
+                    x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                    x509.IPAddress(ipaddress.ip_address("::1"))]), critical=False)
+                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+                .sign(key, hashes.SHA256()))
+        _private_file(key_path, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                  serialization.NoEncryption()))
+        _private_file(cert_path, cert.public_bytes(serialization.Encoding.PEM))
+    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    return cert_path, key_path, cert.fingerprint(hashes.SHA256()).hex(":").upper()
+
+
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # failed TLS handshakes (plain-HTTP clients, a browser rejecting the certificate) and dropped connections
+        if isinstance(sys.exc_info()[1], (ssl.SSLError, ConnectionError)):
+            return
+        super().handle_error(request, client_address)
+
+
+def make_handler(sb: Sandbox, autoresume: bool = True, token: Optional[str] = None) -> type:
+    """token None: no authentication (--pants-down-mode)."""
     mutate = threading.Lock()  # one state-changing operation at a time (sync vs spawn, etc.)
     stopping: Set[str] = set()  # stops run in the background, so several can be queued at once
     stopping_lock = threading.Lock()
@@ -37,6 +103,13 @@ def make_handler(sb: Sandbox, autoresume: bool = True) -> type:
                 sys.stderr.write("portal: " + fmt % args + "\n")
 
         # ------------------------------------------------------------ helpers
+
+        def authed(self) -> bool:
+            if token is None:
+                return True
+            c = cookies.SimpleCookie(self.headers.get("Cookie", ""))
+            got = c[COOKIE].value if COOKIE in c else self.headers.get("X-Token", "")
+            return hmac.compare_digest(got, token)
 
         def send(self, code: int, body: Any, ctype: str = "application/json", extra: Optional[Dict[str, str]] = None) -> None:
             data = body if isinstance(body, bytes) else (json.dumps(body) if ctype == "application/json" else body).encode()
@@ -74,7 +147,16 @@ def make_handler(sb: Sandbox, autoresume: bool = True) -> type:
             url = urlparse(self.path)
             q = parse_qs(url.query)
             if url.path == "/":
+                if token is not None and "token" in q:
+                    if not hmac.compare_digest(q["token"][0], token):
+                        return self.send(403, "bad token", "text/plain")
+                    c = f"{COOKIE}={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=31536000"
+                    return self.send(303, b"", "text/plain", {"Location": "/", "Set-Cookie": c})
+                if not self.authed():
+                    return self.send(403, "Open the URL printed by portal.py (it contains the access token).", "text/plain")
                 return self.send(200, PAGE, "text/html")
+            if not self.authed():
+                return self.send(403, {"error": "not authorised"})
             parts = url.path.strip("/").split("/")
 
             def num(k: str) -> Optional[int]:
@@ -97,6 +179,8 @@ def make_handler(sb: Sandbox, autoresume: bool = True) -> type:
 
         def do_POST(self) -> None:
             # custom header: cross-site forms can't set it, so this also blocks CSRF
+            if not self.authed():
+                return self.send(403, {"error": "not authorised"})
             if self.headers.get("X-Portal") != "1":
                 return self.send(403, {"error": "missing X-Portal header"})
             try:
@@ -175,11 +259,30 @@ def make_handler(sb: Sandbox, autoresume: bool = True) -> type:
     return Handler
 
 
-def serve(sb: Sandbox, host: str = "127.0.0.1", port: int = 8765, autoresume: bool = True) -> None:
-    httpd = ThreadingHTTPServer((host, port), make_handler(sb, autoresume))
-    print(f"sandbox portal: http://{host}:{port}/", flush=True)
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        print("  listening beyond localhost: make sure this address is only reachable over your VPN", flush=True)
+def serve(sb: Sandbox, host: str = "127.0.0.1", port: int = 8765, autoresume: bool = True,
+          insecure: bool = False) -> None:
+    """insecure: --pants-down-mode (no token, plain HTTP, any address)."""
+    if insecure:
+        httpd = Server((host, port), make_handler(sb, autoresume))
+        print(f"sandbox portal: http://{host}:{port}/", flush=True)
+        print(f"  {INSECURE_FLAG}: NO login, NO encryption. Anyone who can reach {host}:{port} can run, stop and delete\n"
+              "  your workers, spend your subscription and read every log.", flush=True)
+    else:
+        if host not in LOOPBACK:
+            raise SandboxError(f"refusing to listen on {host}: the portal only listens on localhost. From another "
+                               f"device, forward the port (e.g. ssh -L {port}:127.0.0.1:{port} this-host). "
+                               f"{INSECURE_FLAG} lifts this and turns off the login and TLS too.")
+        token = load_token(sb)
+        cert, key, fingerprint = load_cert(sb)
+        httpd = Server((host, port), make_handler(sb, autoresume, token))
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(cert, key)
+        # handshake in the request's thread, so a stalled client can't block accept()
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
+        print(f"sandbox portal: https://{host}:{port}/?token={token}", flush=True)
+        print(f"  self-signed certificate; your browser warns once. Accept it only if it shows SHA-256\n  {fingerprint}",
+              flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -212,11 +315,11 @@ main{display:grid;grid-template-columns:260px 1fr;gap:16px;padding:16px}
 .dot.running{background:var(--ok)}.dot.exited{background:var(--muted)}.dot.err{background:var(--bad)}
 .dot.paused,.dot.stopping{background:var(--warn)}.dot.limited{background:none;border:2px solid var(--warn)}
 .ts{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums;margin-right:6px;font-family:system-ui,sans-serif}
-.ev>.ts{display:block}.ev.prompt pre{border-left:3px solid var(--accent)}
+.ev>.ts{display:block}.ev.prompt{border-left:3px solid var(--accent);padding-left:8px}
 #earlier{text-align:center}#earlier button{margin:4px 0 8px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px;margin-top:10px}
 .card{text-align:left;padding:10px;display:flex;flex-direction:column;gap:4px;min-width:0}
-.card .last{white-space:pre-wrap;word-break:break-word;max-height:7.5em;overflow:hidden;font-size:13px}
+.card .last{word-break:break-word;max-height:9em;overflow:hidden;font-size:13px}.card .last p{margin:2px 0}
 .auto{display:flex;align-items:center;gap:4px;margin:0;font-size:12px;color:var(--muted)}.auto input{width:auto}
 label{display:block;font-size:12px;color:var(--muted);margin:8px 0 2px}
 input,select,textarea{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px}
@@ -229,6 +332,8 @@ details.tool summary{cursor:pointer;color:var(--muted);font-family:ui-monospace,
 details.tool.err{border-left-color:var(--bad)}
 pre{background:var(--code);padding:8px;border-radius:6px;overflow:auto;font-size:12px;white-space:pre-wrap;word-break:break-word;margin:4px 0}
 .result{border:1px solid var(--accent);border-radius:8px;padding:8px 12px}
+.md blockquote{margin:6px 0;padding-left:10px;border-left:3px solid var(--line);color:var(--muted)}
+.md hr{border:0;border-top:1px solid var(--line);margin:10px 0}
 .md p{margin:6px 0}.md ul,.md ol{margin:6px 0;padding-left:22px}.md li.sub{margin-left:18px}
 .md h3,.md h4,.md h5,.md h6{margin:10px 0 4px;font-size:14px}.md h3{font-size:15px}
 .md code{background:var(--code);padding:1px 4px;border-radius:4px;font-size:12px;font-family:ui-monospace,monospace}
@@ -272,15 +377,20 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;
 // Minimal markdown: escape first, then add a known-safe subset of tags (worker output is untrusted)
 function mdInline(t){
   return t.replace(/`([^`]+)`/g,'<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>')
+    .replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/(^|\W)__([^_]+)__(?!\w)/g,'$1<b>$2</b>')
+    .replace(/~~([^~]+)~~/g,'<s>$1</s>')
     .replace(/(^|[^*\w])\*([^*\s][^*]*)\*(?!\w)/g,'$1<i>$2</i>')
     .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
 }
+const unesc = s => s.replace(/&(lt|gt|quot|amp);/g, (_, e) => ({lt:'<',gt:'>',quot:'"',amp:'&'}[e]));
 function md(src){
   const lines=esc(src).split('\n'), out=[]; let i=0;
   while(i<lines.length){
     let l=lines[i];
     if(/^```/.test(l)){const buf=[];i++;while(i<lines.length&&!/^```/.test(lines[i]))buf.push(lines[i++]);i++;out.push('<pre>'+buf.join('\n')+'</pre>');continue}
+    if(/^\s*([-*_])(\s*\1){2,}\s*$/.test(l)){out.push('<hr>');i++;continue}
+    if(/^\s*&gt;/.test(l)){const buf=[];while(i<lines.length&&/^\s*&gt;/.test(lines[i]))buf.push(lines[i++].replace(/^\s*&gt;\s?/,''));
+      out.push('<blockquote>'+md(unesc(buf.join('\n')))+'</blockquote>');continue}
     let m=l.match(/^(#{1,6})\s+(.*)/);
     if(m){out.push(`<h${Math.min(m[1].length+2,6)}>${mdInline(m[2])}</h${Math.min(m[1].length+2,6)}>`);i++;continue}
     if(/^\s*\|.*\|\s*$/.test(l)&&i+1<lines.length&&/^\s*\|[\s:|-]+\|\s*$/.test(lines[i+1])){
@@ -296,7 +406,7 @@ function md(src){
       const tag=ordered?'ol':'ul';
       out.push(`<${tag}>`+items.map(([ind,t])=>`<li${ind>=2?' class="sub"':''}>${mdInline(t)}</li>`).join('')+`</${tag}>`);continue}
     if(!l.trim()){i++;continue}
-    const para=[];while(i<lines.length&&lines[i].trim()&&!/^(```|#{1,6}\s|\s*([-*]|\d+\.)\s|\s*\|)/.test(lines[i]))para.push(lines[i++]);
+    const para=[];while(i<lines.length&&lines[i].trim()&&!/^(```|#{1,6}\s|\s*([-*]|\d+\.)\s|\s*\||\s*&gt;)/.test(lines[i]))para.push(lines[i++]);
     if(!para.length)para.push(lines[i++]);
     out.push('<p>'+mdInline(para.join('<br>'))+'</p>');
   }
@@ -307,10 +417,11 @@ async function get(p){const r=await fetch(p);const j=await r.json();if(!r.ok)thr
 async function post(p,b){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json','X-Portal':'1'},body:JSON.stringify(b||{})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j.result}
 async function act(what, body, confirmText){
   if(confirmText && !confirmDialog(confirmText)) return;
-  document.querySelectorAll('button').forEach(b=>b.disabled=true);
+  const b=document.activeElement&&document.activeElement.tagName==='BUTTON'?document.activeElement:null;
+  if(b)b.disabled=true;  // only the clicked button waits; the rest of the page stays usable
   toast(what+'…');
   try{const r=await post('/api/'+what, body);toast(r||'done');}catch(e){toast(e.message,true)}
-  document.querySelectorAll('button').forEach(b=>b.disabled=false);
+  if(b)b.disabled=false;
   refresh();
 }
 function confirmDialog(t){return window.confirm ? window.confirm(t) : true}
@@ -331,6 +442,7 @@ const live = w => w.state==='running' || w.state==='paused';
 function dotCls(w){
   if(w.stopping) return 'stopping';
   if(live(w)) return w.state;
+  if(w.state==='created') return 'err';  // container made but never started
   if(w.limited) return 'limited';
   return w.result&&w.result.subtype!=='success'?'err':'exited';
 }
@@ -342,20 +454,30 @@ function statusText(w){
   }
   return t;
 }
-const fmtEpoch = t => new Date(t*1000).toLocaleString([],{weekday:'short',hour:'2-digit',minute:'2-digit'});
+// Times: 24-hour, in the browser's time zone unless one is picked (Overview); a browser that hides its zone reports UTC
+const detectedTZ = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+let TZ = (()=>{try{return localStorage.getItem('tz')||detectedTZ}catch(_){return detectedTZ}})();
+function tfmt(d, opt){try{return d.toLocaleString([],{hourCycle:'h23',timeZone:TZ,...opt})}catch(_){return d.toLocaleString([],{hourCycle:'h23',...opt})}}
+const sameDay = (a,b) => tfmt(a,{year:'numeric',month:'numeric',day:'numeric'})===tfmt(b,{year:'numeric',month:'numeric',day:'numeric'});
+const fmtEpoch = t => tfmt(new Date(t*1000),{weekday:'short',hour:'2-digit',minute:'2-digit'});
+function setTZ(z){TZ=z||detectedTZ;try{z&&z!==detectedTZ?localStorage.setItem('tz',z):localStorage.removeItem('tz')}catch(_){};refresh();if(L.url)startLog(L.url)}
+function tzPicker(){
+  const zones=(Intl.supportedValuesOf?Intl.supportedValuesOf('timeZone'):[]).filter(z=>z!==TZ);
+  return `<label class="auto">times in <select style="width:auto" onchange="setTZ(this.value)"><option value="${esc(TZ)}">${esc(TZ)}${TZ===detectedTZ?' (detected)':''}</option>${TZ!==detectedTZ?`<option value="${esc(detectedTZ)}">${esc(detectedTZ)} (detected)</option>`:''}${zones.map(z=>`<option>${esc(z)}</option>`).join('')}</select></label>`;
+}
 function ago(t){const s=Math.max(0,Math.round(Date.now()/1000-t));return s<90?s+'s':s<5400?Math.round(s/60)+' min':s<172800?Math.round(s/3600)+' h':Math.round(s/86400)+' d'}
 function fmtTs(ts){
   const d=new Date(ts); if(!ts||isNaN(d))return '';
-  return d.toDateString()===new Date().toDateString()
-    ? d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})
-    : d.toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+  return sameDay(d,new Date())
+    ? tfmt(d,{hour:'2-digit',minute:'2-digit',second:'2-digit'})
+    : tfmt(d,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
 }
-function tsTag(ts){const t=fmtTs(ts);return t?`<time class="ts" title="${esc(new Date(ts).toLocaleString())}">${esc(t)}</time>`:''}
+function tsTag(ts){const t=fmtTs(ts);return t?`<time class="ts" title="${esc(tfmt(new Date(ts),{dateStyle:'medium',timeStyle:'long'}))}">${esc(t)}</time>`:''}
 async function setAuto(on){try{toast(await post('/api/autoresume',{enabled:on}))}catch(e){toast(e.message,true)}refresh()}
 function renderUsage(u){
   const el=$('#usage');
   if(!u){el.innerHTML='<span class="note">usage: no data yet</span>';return}
-  const w=u.unifiedWindows||{}, fmt=(t,opt)=>new Date(t*1000).toLocaleString([],opt);
+  const w=u.unifiedWindows||{}, fmt=(t,opt)=>tfmt(new Date(t*1000),opt);
   const row=(label,x,opt)=>{ if(!x)return''; const p=Math.round((x.utilization||0)*100);
     const cls=p>=90?'high':p>=70?'mid':'';
     return `<span>${label}</span><span class="bar" title="resets ${esc(fmt(x.resetsAt,opt))}"><i class="${cls}" style="width:${Math.min(p,100)}%"></i></span><span>${p}%</span><span class="sep">·</span>`};
@@ -365,8 +487,8 @@ function renderUsage(u){
     + row('5h',w.five_hour,{hour:'2-digit',minute:'2-digit'}) + row('7d',w.seven_day,{weekday:'short',hour:'2-digit',minute:'2-digit'})
     + `<span class="note">${age<1?'updated now':age+' min ago'}</span>`;
 }
-function models(){return S.models.map(m=>`<option value="${m}">${m||'default model'}</option>`).join('')}
-function efforts(){return S.efforts.map(e=>`<option value="${e}">${e?'effort: '+e:'default effort'}</option>`).join('')}
+function models(cur){return S.models.map(m=>`<option value="${m}"${m===(cur||'')?' selected':''}>${m||'default model'}</option>`).join('')}
+function efforts(cur){return S.efforts.map(e=>`<option value="${e}"${e===(cur||'')?' selected':''}>${e?'effort: '+e:'default effort'}</option>`).join('')}
 const runInfo = w => [w.model, w.effort && 'effort '+w.effort].filter(Boolean).join(' · ');
 function renderNew(){
   stopLog();
@@ -406,13 +528,18 @@ function renderHeader(){
         ${running&&!w.stopping?`<button class="danger" onclick="act('stop',{name:'${n}'},'Stop ${n}?')">Stop</button>`:''}
         <button onclick="fetchReview('${esc(w.name)}')">Fetch + review</button>
         <button onclick="showDiff('${esc(w.name)}')">Diff</button>
+        ${running||w.stopping?'':`<button class="primary" onclick="resumeNow('${n}')" title="continue its session with the last run's model and effort">Resume</button>`}
         ${running||w.stopping?'':`<button class="danger" onclick="act('rm',{name:'${esc(w.name)}'},'Delete worker ${esc(w.name)} and its clone? Fetch first if you want its work.').then(()=>select(null))">Remove</button>`}
         <label style="margin:0"><input type="checkbox" style="width:auto" ${follow?'checked':''} onchange="follow=this.checked"> follow</label>
       </div></div>
-    <details><summary class="meta">Task</summary><pre>${esc(w.prompt)}</pre></details>
+    <details><summary class="meta">Task</summary><div class="md">${md(w.prompt)}</div></details>
     ${running||w.stopping?'':`<form onsubmit="event.preventDefault();followup('${esc(w.name)}')" style="margin-top:6px">
       <label>Follow-up prompt (continues this worker's session)</label><textarea id="fprompt" required></textarea>
-      <div class="row" style="margin-top:6px"><select id="fmodel" style="width:auto">${models()}</select><select id="feffort" style="width:auto">${efforts()}</select><button class="primary">Send follow-up</button></div></form>`}`;
+      <div class="row" style="margin-top:6px"><select id="fmodel" style="width:auto">${models(w.run_model)}</select><select id="feffort" style="width:auto">${efforts(w.effort)}</select><button class="primary">Send follow-up</button></div></form>`}`;
+}
+async function resumeNow(name){
+  const w=S.workers.find(x=>x.name===name)||{};
+  await act('resume',{name,prompt:'Continue the task from where you left off.',model:w.run_model||'',effort:w.effort||''});startLog(L.url,true)
 }
 async function followup(name){await act('resume',{name,prompt:$('#fprompt').value,model:$('#fmodel').value,effort:$('#feffort').value});startLog(L.url,true)}
 async function fetchReview(name){
@@ -427,18 +554,18 @@ async function showDiff(name){
 }
 async function showLearnings(){
   sel=null; view='learn'; stopLog(); refresh();
-  try{const l=await get('/api/learnings');$('#detail').innerHTML=`<b id="learnview">Proposed learnings</b><pre>${esc(l)||'(none yet)'}</pre>`}catch(e){toast(e.message,true)}
+  try{const l=await get('/api/learnings');$('#detail').innerHTML=`<b id="learnview">Proposed learnings</b><div class="md">${l?md(l):'<p class="meta">(none yet)</p>'}</div>`}catch(e){toast(e.message,true)}
 }
 function showOverview(){view='overview';sel=null;stopLog();$('#detail').innerHTML='<div id="ov"></div>';refresh()}
 function renderOverview(){
   const el=$('#ov'); if(!el)return;
   const count=st=>S.workers.filter(w=>w.state===st).length, lim=S.workers.filter(w=>w.limited&&!live(w)).length;
-  el.innerHTML=`<div class="row" style="justify-content:space-between"><b>Overview</b><span class="meta">${count('running')} running · ${count('paused')} paused${lim?' · '+lim+' stopped on usage limit':''} · ${S.workers.length} total</span></div>
+  el.innerHTML=`<div class="row" style="justify-content:space-between"><b>Overview</b><span class="meta">${tzPicker()} ${count('running')} running · ${count('paused')} paused${lim?' · '+lim+' stopped on usage limit':''} · ${S.workers.length} total</span></div>
     <div class="grid">${S.workers.map(w=>`<button class="card" onclick="select('${esc(w.name)}')">
       <div><span class="dot ${dotCls(w)}"></span><b>${esc(w.name)}</b></div>
       <div class="meta">${esc(statusText(w))}${runInfo(w)?' · '+esc(runInfo(w)):''}${w.result&&w.result.cost!=null?' · $'+w.result.cost.toFixed(2):''}</div>
       <div class="meta">${w.active_at?'last message '+ago(Date.parse(w.active_at)/1000)+' ago':'no messages yet'}</div>
-      ${w.last?`<div class="last">${esc(w.last.text)}</div>`:''}</button>`).join('')||'<div class="empty">No workers yet.</div>'}</div>`;
+      ${w.last?`<div class="last md">${md(w.last.text)}</div>`:''}</button>`).join('')||'<div class="empty">No workers yet.</div>'}</div>`;
 }
 async function showOrch(){
   view='orch'; sel=null; stopLog(); refresh();
@@ -490,7 +617,7 @@ async function loadEarlier(){
 function addEvent(e,box){
   const ts=tsTag(e.ts);
   if(e.kind==='text'){box.insertAdjacentHTML('beforeend',`<div class="ev md">${ts}${md(e.text)}</div>`)}
-  else if(e.kind==='prompt'){box.insertAdjacentHTML('beforeend',`<div class="ev prompt">${ts}<pre>${esc(e.text)}</pre></div>`)}
+  else if(e.kind==='prompt'){box.insertAdjacentHTML('beforeend',`<div class="ev prompt md">${ts}${md(e.text)}</div>`)}
   else if(e.kind==='tool'){
     let first=e.input; try{const o=JSON.parse(e.input);first=o.command||o.file_path||o.pattern||o.description||e.input}catch(_){}
     const d=document.createElement('details');d.className='tool';
@@ -510,11 +637,18 @@ refresh(); setInterval(refresh, 5000);
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--host", default="127.0.0.1", help="address to bind (use your VPN address for phone access)")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help=f"address to bind (only localhost, unless {INSECURE_FLAG})")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--no-autoresume", action="store_true", help="start with auto-resume after the usage limit off")
+    ap.add_argument(INSECURE_FLAG, dest="insecure", action="store_true",
+                    help="no access token, plain HTTP, and any --host. Anyone who can reach the port controls your workers")
     args = ap.parse_args()
-    serve(Sandbox(), args.host, args.port, not args.no_autoresume)
+    try:
+        serve(Sandbox(), args.host, args.port, not args.no_autoresume, args.insecure)
+    except SandboxError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -16,10 +16,23 @@ from docker.transport.sshconn import SSHHTTPAdapter
 BASE_URL = "http+docker://ssh"
 
 
+# HTTP connections (= ssh channels) to the docker daemon. sshd allows 10 channels per connection (MaxSessions) and
+# sandbox.Sandbox needs some for exec and sftp, so docker gets a few and waits for a free one beyond that.
+POOL_SIZE = 3
+
+
 class _VMAdapter(SSHHTTPAdapter):
     def __init__(self, client: paramiko.SSHClient):
         self._vm_client = client
-        super().__init__("ssh://vm", timeout=60)
+        super().__init__("ssh://vm", timeout=60, max_pool_size=POOL_SIZE)
+
+    def get_connection(self, url: str, proxies: Any = None) -> Any:
+        # docker-py keys its pools by the full request URL, and each pool keeps its connection (an open ssh channel)
+        # idle: one channel per container ever inspected, until sshd refuses new ones and a create succeeds but its
+        # start fails. One pool for everything, blocking when all its connections are busy.
+        pool = super().get_connection(BASE_URL, proxies)
+        pool.block = True
+        return pool
 
     def _create_paramiko_client(self, base_url: str) -> None:
         self.ssh_client = self._vm_client
