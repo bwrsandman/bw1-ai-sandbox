@@ -24,7 +24,8 @@ clone this repo and the project repos into it, then run the scripts.
 > - **Agents can write to your Ghidra project** through MCP, and the VM is allowed to reach the Ghidra port on your
 >   host.
 >
-> No warranty of any kind. If you need real isolation, use a disposable machine you can wipe.
+> This software is distributed without warranty. If you need real isolation, use a disposable machine you can
+> wipe.
 
 ## Layout
 
@@ -274,3 +275,7 @@ libvirt bridge IP, or run `./sandbox.py ghidra-forward`. A host firewall must al
 `tools/decomp-queue.py`); they must be in the commit you sync. New idioms go to each worker's `~/learnings.md`; the
 orchestrator curates them (`learnings` tool) into `bw1-decomp/docs/msvc6_idioms.md`, you commit, the next `sync` hands
 them to every worker.
+
+## License
+
+[MIT](LICENSE). This software is distributed without warranty.
