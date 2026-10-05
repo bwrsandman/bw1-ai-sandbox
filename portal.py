@@ -490,19 +490,26 @@ function renderUsage(u){
 function models(cur){return S.models.map(m=>`<option value="${m}"${m===(cur||'')?' selected':''}>${m||'default model'}</option>`).join('')}
 function efforts(cur){return S.efforts.map(e=>`<option value="${e}"${e===(cur||'')?' selected':''}>${e?'effort: '+e:'default effort'}</option>`).join('')}
 const runInfo = w => [w.model, w.effort && 'effort '+w.effort].filter(Boolean).join(' · ');
-const EXAMPLE_TASK='For the following TU, try to get all the .text functions to 100%, then do the data segments, then backport to 1.1 and 1.0, then set the TU to matching in configure.py: FileToDecompile.cpp';
-// First focus selects the trailing TU name so typing replaces just that.
+const EXAMPLE_TASK=['For the following TU, try to get all the .text functions to 100%, then do the data segments, then backport to 1.1 and 1.0, then set the TU to matching in configure.py: FileToDecompile.cpp',
+  '',
+  'Before finishing, clean up so it passes review:',
+  '- Use defines, enums, array sizes or compile-time expressions instead of non-trivial magic values.',
+  '- bool32_t variables use true and false, not 1 and 0.',
+  '- Arguments to enum or bool32_t parameters use the proper type (enum value, true/false), not an integer literal.',
+  '- Don\'t leave TODO comments when cleaning up.',
+  '- Rename any anonymous function parameter or struct/class member variable (param_N, field_0xNN) used in a decompiled function.'].join('\n');
+// First focus selects the example's TU name so typing replaces just that.
 function pickTU(t){if(t.dataset.picked)return;t.dataset.picked=1;if(t.value!==EXAMPLE_TASK)return;
-  setTimeout(()=>t.setSelectionRange(t.value.lastIndexOf(' ')+1,t.value.length))}
+  const i=t.value.indexOf('FileToDecompile.cpp');setTimeout(()=>t.setSelectionRange(i,i+'FileToDecompile.cpp'.length))}
 // The example's TU name must be replaced before the form submits.
-function checkTU(t){t.setCustomValidity(/\bFileToDecompile\.cpp\s*$/.test(t.value)?'Replace FileToDecompile.cpp with your TU':'')}
+function checkTU(t){t.setCustomValidity(/\bFileToDecompile\.cpp\b/.test(t.value)?'Replace FileToDecompile.cpp with your TU':'')}
 function renderNew(){
   stopLog();
   $('#detail').innerHTML = `<form id="newform" onsubmit="event.preventDefault();spawn()">
     <b>New worker</b>
     <label>Name (letters, digits, - _)</label><input id="nname" required pattern="[A-Za-z0-9_-]+" autocomplete="off">
     <label>Model / effort</label><div class="row"><select id="nmodel" style="flex:1">${models()}</select><select id="neffort" style="flex:1">${efforts()}</select></div>
-    <label>Task</label><textarea id="nprompt" required onfocus="pickTU(this)" oninput="checkTU(this)">${EXAMPLE_TASK}</textarea>
+    <label>Task</label><textarea id="nprompt" rows="10" required onfocus="pickTU(this)" oninput="checkTU(this)">${EXAMPLE_TASK}</textarea>
     <div class="row" style="margin-top:8px"><button class="primary">Spawn</button></div></form>`;
   checkTU($('#nprompt'));
 }
